@@ -7,10 +7,12 @@ RUN apt-get update && apt-get install -y \
     make \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /usr/src/zerofs
+WORKDIR /usr/src
 
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+COPY zerofs/Cargo.toml zerofs/Cargo.lock ./zerofs/
+COPY zerofs/src ./zerofs/src
+
+WORKDIR /usr/src/zerofs
 
 RUN cargo build --release
 
@@ -26,9 +28,7 @@ COPY --from=builder /usr/src/zerofs/target/release/zerofs /usr/local/bin/zerofs
 RUN useradd -m -u 1001 zerofs
 USER zerofs
 
-ENV ZEROFS_NFS_HOST=0.0.0.0
-ENV ZEROFS_NBD_HOST=0.0.0.0
-
-EXPOSE 2049
+# Default ports that might be used - actual configuration comes from TOML file
+EXPOSE 2049 5564 10809
 
 ENTRYPOINT ["zerofs"]

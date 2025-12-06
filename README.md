@@ -1,18 +1,31 @@
 <p align="center">
-  <img src="assets/readme_logo.png" alt="ZeroFS Logo" width="500">
+  <a href="https://www.zerofs.net">
+    <img src="https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/readme_logo.png" alt="ZeroFS Logo" width="500">
+  </a>
 </p>
+
+<div align="center">
+
+![GitHub Release](https://img.shields.io/github/v/release/barre/zerofs)
+![GitHub License](https://img.shields.io/github/license/barre/zerofs)
+<a href="https://discord.gg/5PxcuUeaaT">![Discord](https://img.shields.io/discord/1310528344730632292)</a>
+
+
+**[Documentation](https://www.zerofs.net)** | **[QuickStart](https://www.zerofs.net/quickstart)** | **[ZeroFS vs AWS EFS](https://www.zerofs.net/zerofs-vs-aws-efs)**
+
+</div>
 
 # ZeroFS - The Filesystem That Makes S3 your Primary Storage
 ## File systems AND block devices on S3 storage
 
-ZeroFS makes S3 storage feel like a real filesystem. Built on [SlateDB](https://github.com/slatedb/slatedb), it provides both **file-level access via NFS** and **block-level access via NBD**. Fast enough to compile code on, with clients already built into your OS. No FUSE drivers, no kernel modules, just mount and go.
+ZeroFS makes S3 storage feel like a real filesystem. It provides **file-level access via NFS and 9P** and **block-level access via NBD**.
 
-Join our community on Discord: https://discord.gg/eGKNQTbG
 
 **Key Features:**
 - **NFS Server** - Mount as a network filesystem on any OS
+- **9P Server** - High-performance alternative with better POSIX semantics
 - **NBD Server** - Access as raw block devices for ZFS, databases, or any filesystem
-- **Always Encrypted** - ChaCha20-Poly1305 encryption with compression
+- **Always Encrypted** - XChaCha20-Poly1305 encryption with compression
 - **High Performance** - Multi-layered caching with microsecond latencies
 - **S3 Compatible** - Works with any S3-compatible storage
 
@@ -22,20 +35,28 @@ ZeroFS passes all tests in the [pjdfstest_nfs](https://github.com/Barre/pjdfstes
 
 We use ZFS as an end-to-end test in our CI. [We create ZFS pools on ZeroFS](https://github.com/Barre/ZeroFS/actions/workflows/zfs-test.yml), extract the Linux kernel source tree, and run scrub operations to verify data integrity. All operations complete without errors.
 
+We also [compile the Linux kernel on ZeroFS](https://github.com/Barre/ZeroFS/actions/workflows/kernel-compile-9p.yml) as part of our CI, using parallel compilation (`make -j$(nproc)`) to stress-test concurrent operations.
+
 ## Demo
+
+### Compiling the linux kernel on top of S3
+
+Compiling the Linux Kernel in 16 seconds with a ZeroFS NBD volume + ZFS
+
+<a href="https://asciinema.org/a/730946" target="_blank"><img src="https://asciinema.org/a/730946.png" /></a>
 
 ### ZFS on S3 via NBD
 
 ZeroFS provides NBD block devices that ZFS can use directly - no intermediate filesystem needed. Here's ZFS running on S3 storage:
 
-<a href="https://asciinema.org/a/728234" target="_blank"><img src="https://asciinema.org/a/728234.svg" /></a>
+<a href="https://asciinema.org/a/728234" target="_blank"><img src="https://asciinema.org/a/728234.png" /></a>
 
 ### Ubuntu Running on ZeroFS
 
 Watch Ubuntu boot from ZeroFS:
 
 <p align="center">
-<a href="https://asciinema.org/a/728172" target="_blank"><img src="https://asciinema.org/a/728172.svg" /></a>
+<a href="https://asciinema.org/a/728172" target="_blank"><img src="https://asciinema.org/a/728172.png" /></a>
 </p>
 
 ### Self-Hosting ZeroFS
@@ -43,58 +64,295 @@ Watch Ubuntu boot from ZeroFS:
 ZeroFS can self-host! Here's a demo showing Rust's toolchain building ZeroFS while running on ZeroFS:
 
 <p align="center">
-<a href="https://asciinema.org/a/728101" target="_blank"><img src="https://asciinema.org/a/728101.svg" /></a>
+<a href="https://asciinema.org/a/728101" target="_blank"><img src="https://asciinema.org/a/728101.png" /></a>
 </p>
+
+## Architecture
+
+```mermaid
+
+graph TB
+    subgraph "Client Layer"
+        NFS[NFS Client]
+        P9[9P Client]
+        NBD[NBD Client]
+    end
+    
+    subgraph "ZeroFS Core"
+        NFSD[NFS Server]
+        P9D[9P Server]
+        NBDD[NBD Server]
+        VFS[Virtual Filesystem]
+        ENC[Encryption Manager]
+        CACHE[Cache Manager]
+        
+        NFSD --> VFS
+        P9D --> VFS
+        NBDD --> VFS
+        VFS --> ENC
+        ENC --> CACHE
+    end
+    
+    subgraph "Storage Backend"
+        SLATE[SlateDB]
+        LSM[LSM Tree]
+        S3[S3 Object Store]
+        
+        CACHE --> SLATE
+        SLATE --> LSM
+        LSM --> S3
+    end
+    
+    NFS --> NFSD
+    P9 --> P9D
+    NBD --> NBDD
+```
+
+## Quick Start
+
+### Installation
+
+#### Install script (Recommended)
+```bash
+curl -sSfL https://sh.zerofs.net | sh
+```
+
+#### Via Cargo
+```bash
+cargo install zerofs
+```
+
+#### Via Docker
+```bash
+docker pull ghcr.io/barre/zerofs:latest
+```
+
+### Getting Started
+
+```bash
+# Generate a configuration file
+zerofs init
+
+# Edit the configuration with your S3 credentials
+$EDITOR zerofs.toml
+
+# Run ZeroFS
+zerofs run -c zerofs.toml
+```
 
 ## Configuration
 
-ZeroFS supports dual-mode access to the same S3-backed storage:
+ZeroFS uses a TOML configuration file that supports environment variable substitution. This makes it easy to manage secrets and customize paths.
 
-- **NFS Mode** - Traditional file-level access for general filesystem use
-- **NBD Mode** - Block-level access for ZFS pools, databases, and raw storage applications
+### Creating a Configuration
 
-Both modes share the same encrypted, compressed, cached storage backend.
-
-You can also use ZeroFS with any supported object store backend by [object_store](https://crates.io/crates/object_store) crate.
-
-You need to pass a URL as the argument to configure your backend, for example:
+Generate a default configuration file:
 ```bash
-zerofs s3://bucket/path
+zerofs init  # Creates zerofs.toml
 ```
 
-Would use Amazon S3 backend for `slatedb` bucket. See [`object_store`'s documentation](https://docs.rs/object_store/0.12.3/object_store/enum.ObjectStoreScheme.html#supported-formats) for all supported formats.
+The configuration file has sections for:
+- **Cache** - Local cache settings for performance
+- **Storage** - S3/Azure/local backend configuration and encryption
+- **Servers** - Enable/disable NFS, 9P, and NBD servers
+- **Cloud credentials** - AWS or Azure authentication
 
-### Required Environment Variables
+### Example Configuration
 
-- `SLATEDB_CACHE_DIR`: Directory path for SlateDB disk cache (required)
-- `SLATEDB_CACHE_SIZE_GB`: SlateDB disk cache size in gigabytes (required, must be a positive number)
-- `ZEROFS_ENCRYPTION_PASSWORD`: Password for filesystem encryption (required)
+```toml
+[cache]
+dir = "${HOME}/.cache/zerofs"
+disk_size_gb = 10.0
+memory_size_gb = 1.0  # Optional, defaults to 0.25
 
-### Optional Environment Variables
+[storage]
+url = "s3://my-bucket/zerofs-data"
+encryption_password = "${ZEROFS_PASSWORD}"
 
-You can configure your object store with optional set of environment variables depending on your backing implementation. For example, if you're using an Amazon S3 backend:
+[filesystem]
+max_size_gb = 100.0  # Optional: limit filesystem to 100 GB (defaults to 8 EiB)
 
-- `AWS_ENDPOINT`: S3-compatible endpoint URL
-- `AWS_ACCESS_KEY_ID`: AWS access key ID
-- `AWS_SECRET_ACCESS_KEY`: AWS secret access key
-- `AWS_DEFAULT_REGION`: AWS region (default: `"us-east-1"`)
-- `AWS_ALLOW_HTTP`: Allow HTTP connections (default: `"false"`)
-- `ZEROFS_NFS_HOST`: Address (IP or hostname) to bind the NFS TCP socket (default: `"127.0.0.1"`)
-- `ZEROFS_NFS_HOST_PORT`: Port to bind the NFS TCP socket (default: `2049`)
-- `ZEROFS_NBD_HOST`: Address (IP or hostname) to bind the NBD TCP sockets (default: `"127.0.0.1"`)
-- `ZEROFS_NBD_PORTS`: Comma-separated list of ports for NBD servers (optional)
-- `ZEROFS_NBD_DEVICE_SIZES_GB`: Comma-separated list of device sizes in GB (optional, must match `ZEROFS_NBD_PORTS` count)
-- `ZEROFS_MEMORY_CACHE_SIZE_GB`: Size of ZeroFS in-memory cache in GB (optional, default: 0.25GB)
+[servers.nfs]
+addresses = ["127.0.0.1:2049"]  # Can specify multiple addresses
 
-See [Available `ObjectStore` Implementations](https://docs.rs/object_store/0.12.3/object_store/index.html#available-objectstore-implementations) for other environment variables.
+[servers.ninep]
+addresses = ["127.0.0.1:5564"]
+unix_socket = "/tmp/zerofs.9p.sock"  # Optional
+
+[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+unix_socket = "/tmp/zerofs.nbd.sock"  # Optional
+
+[aws]
+access_key_id = "${AWS_ACCESS_KEY_ID}"
+secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
+# endpoint = "https://s3.us-east-1.amazonaws.com"  # For S3-compatible services
+# default_region = "us-east-1"
+# allow_http = "true"  # For non-HTTPS endpoints
+
+# [azure]
+# storage_account_name = "${AZURE_STORAGE_ACCOUNT_NAME}"
+# storage_account_key = "${AZURE_STORAGE_ACCOUNT_KEY}"
+```
+
+### Environment Variable Substitution
+
+The configuration supports `${VAR}` syntax for environment variables. This is useful for:
+- Keeping secrets out of configuration files
+- Using different settings per environment
+- Sharing configurations across systems
+
+All referenced environment variables must be set when running ZeroFS.
+
+### Storage Backends
+
+ZeroFS supports multiple storage backends through the `url` field in `[storage]`:
+
+#### Amazon S3
+```toml
+[storage]
+url = "s3://my-bucket/path"
+
+[aws]
+access_key_id = "${AWS_ACCESS_KEY_ID}"
+secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
+# endpoint = "https://s3.us-east-1.amazonaws.com"  # For S3-compatible services
+# default_region = "us-east-1"
+# allow_http = "true"  # For non-HTTPS endpoints (e.g., MinIO)
+```
+
+#### Microsoft Azure
+```toml
+[storage]
+url = "azure://container/path"
+
+[azure]
+storage_account_name = "${AZURE_STORAGE_ACCOUNT_NAME}"
+storage_account_key = "${AZURE_STORAGE_ACCOUNT_KEY}"
+```
+
+#### Google Cloud Storage (GCS)
+
+**Option 1: Application Default Credentials (recommended for GCP VMs/GKE)**
+
+If running on a GCP VM or GKE pod with an attached service account, no configuration is needed:
+```toml
+[storage]
+url = "gs://my-bucket/path"
+# No [gcp] section needed - uses VM/pod service account automatically
+```
+
+**Option 2: Service Account Key File**
+
+```toml
+[storage]
+url = "gs://my-bucket/path"
+
+[gcp]
+service_account = "${GCS_SERVICE_ACCOUNT}"  # Path to service account JSON file
+```
+
+Or set the `GOOGLE_APPLICATION_CREDENTIALS` environment variable:
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
+zerofs server -c zerofs.toml
+```
+
+#### Local Filesystem
+```toml
+[storage]
+url = "file:///path/to/storage"
+# No additional configuration needed
+```
+
+### Server Configuration
+
+You can enable or disable individual servers by including or commenting out their sections:
+
+```toml
+# To disable a server, comment out or remove its entire section
+[servers.nfs]
+addresses = ["0.0.0.0:2049"]  # Bind to all IPv4 interfaces
+# addresses = ["[::]:2049"]  # Bind to all IPv6 interfaces
+# addresses = ["127.0.0.1:2049", "[::1]:2049"]  # Dual-stack localhost
+
+[servers.ninep]
+addresses = ["127.0.0.1:5564"]
+unix_socket = "/tmp/zerofs.9p.sock"  # Optional: adds Unix socket support
+
+[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+unix_socket = "/tmp/zerofs.nbd.sock"  # Optional: adds Unix socket support
+```
+
+### Filesystem Quotas
+
+ZeroFS supports configurable filesystem size limits:
+
+```toml
+[filesystem]
+max_size_gb = 100.0  # Limit filesystem to 100 GB
+```
+
+When the quota is reached, write operations return `ENOSPC` (No space left on device). Delete and truncate operations continue to work, allowing you to free space. If not specified, the filesystem defaults to 8 EiB (effectively unlimited).
+
+### Multiple Instances
+
+ZeroFS supports running multiple instances on the same storage backend: one read-write instance and multiple read-only instances.
+
+```bash
+# Read-write instance (default)
+zerofs run -c zerofs.toml
+
+# Read-only instances
+zerofs run -c zerofs.toml --read-only
+```
+
+Read-only instances automatically see updates from the writer and return `EROFS` errors for write operations.
+
+### Checkpoints
+
+ZeroFS supports creating named checkpoints for point-in-time snapshots.
+
+**Creating and managing checkpoints:**
+
+```bash
+# Create a named checkpoint (requires RPC server and running ZeroFS instance)
+zerofs checkpoint create -c zerofs.toml my-snapshot
+
+# List all checkpoints
+zerofs checkpoint list -c zerofs.toml
+
+# Get checkpoint info
+zerofs checkpoint info -c zerofs.toml my-snapshot
+
+# Delete a checkpoint
+zerofs checkpoint delete -c zerofs.toml my-snapshot
+```
+
+**Opening from a checkpoint (read-only):**
+
+```bash
+# Start ZeroFS from a specific checkpoint
+zerofs run -c zerofs.toml --checkpoint my-snapshot
+```
+
+**RPC server configuration** (required for checkpoint commands):
+
+```toml
+[servers.rpc]
+addresses = ["127.0.0.1:7000"]
+unix_socket = "/tmp/zerofs.rpc.sock"
+```
 
 ### Encryption
 
-Encryption is always enabled in ZeroFS. All file data is encrypted using ChaCha20-Poly1305 authenticated encryption with zstd compression. A password is required to start the filesystem:
+Encryption is always enabled in ZeroFS. All file data is encrypted using XChaCha20-Poly1305 authenticated encryption with lz4 compression. Configure your password in the configuration file:
 
-```bash
-# Start ZeroFS with encryption password
-ZEROFS_ENCRYPTION_PASSWORD='your-secure-password' zerofs s3://bucket/path
+```toml
+[storage]
+url = "s3://my-bucket/data"
+encryption_password = "${ZEROFS_PASSWORD}"  # Or use a literal password (not recommended)
 ```
 
 #### Password Management
@@ -104,18 +362,19 @@ On first run, ZeroFS generates a 256-bit data encryption key (DEK) and encrypts 
 To change your password:
 
 ```bash
-# Change the encryption password
-ZEROFS_ENCRYPTION_PASSWORD='current-password' \
-ZEROFS_NEW_PASSWORD='new-password' \
-zerofs s3://bucket/path
+# Change the encryption password (reads new password from stdin)
+echo "new-secure-password" | zerofs change-password -c zerofs.toml
+
+# Or read from a file
+zerofs change-password -c zerofs.toml < new-password.txt
 ```
 
-The program will change the password and exit. Then you can use the new password for future runs.
+After changing the password, update your configuration file or environment variable to use the new password for future runs.
 
 #### What's Encrypted vs What's Not
 
 **Encrypted:**
-- All file contents (in 128KB chunks)
+- All file contents (in 32K chunks)
 - File metadata values (permissions, timestamps, etc.)
 
 **Not Encrypted:**
@@ -128,31 +387,73 @@ This should be fine for most use-cases but if you need to hide directory structu
 
 ## Mounting the Filesystem
 
-### macOS
+### 9P (Recommended for better performance and FSYNC POSIX semantics)
+
+9P provides better performance and more accurate POSIX semantics, especially for fsync/commit operations. When fsync is called on 9P, ZeroFS receives a proper signal to flush data to stable storage, ensuring strong durability guarantees.
+
+**Note on durability:** With NFS, ZeroFS reports writes as "stable" to the client even though they are actually unstable (buffered in memory/cache). This is done to avoid performance degradation, as otherwise each write would translate to an fsync-like operation (COMMIT in NFS terms). During testing, we expected clients to call COMMIT on FSYNC, but tested clients (macOS and Linux) don't follow this pattern. If you require strong durability guarantees, 9P is strongly recommended over NFS.
+
+#### TCP Mount (default)
 ```bash
-mount -t nfs -o async,nolocks,vers=3,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ mnt
+mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/9p
 ```
 
-### Linux
+#### Unix Socket Mount (lower latency for local access)
+For improved performance when mounting locally, you can use Unix domain sockets which eliminate TCP/IP stack overhead:
+
 ```bash
-mount -t nfs -o vers=3,async,nolock,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ /mnt
+# Configure Unix socket in zerofs.toml
+# [servers.ninep]
+# unix_socket = "/tmp/zerofs.9p.sock"
+
+# Mount using Unix socket
+mount -t 9p -o trans=unix,version=9p2000.L,cache=mmap,access=user /tmp/zerofs.9p.sock /mnt/9p
+```
+
+Unix sockets avoid the network stack entirely, making them ideal for local mounts where the client and ZeroFS run on the same machine.
+
+### NFS
+
+#### macOS
+```bash
+mount -t nfs -o async,nolocks,rsize=1048576,wsize=1048576,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ mnt
+```
+
+#### Linux
+```bash
+mount -t nfs -o async,nolock,rsize=1048576,wsize=1048576,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ /mnt
 ```
 
 ## NBD Configuration and Usage
 
-In addition to NFS, ZeroFS can provide raw block devices through NBD with full TRIM/discard support:
+In addition to file-level access, ZeroFS provides raw block devices through NBD with full TRIM/discard support:
 
 ```bash
-# Start ZeroFS with both NFS and NBD support
-ZEROFS_ENCRYPTION_PASSWORD='your-password' \
-ZEROFS_NBD_PORTS='10809,10810,10811' \
-ZEROFS_NBD_DEVICE_SIZES_GB='1,2,5' \
-zerofs s3://bucket/path
+# Configure NBD in zerofs.toml
+# [servers.nbd]
+# addresses = ["127.0.0.1:10809"]
+# unix_socket = "/tmp/zerofs.nbd.sock"  # Optional
 
-# Connect to NBD devices
-nbd-client 127.0.0.1 10809 /dev/nbd0  # 1GB device
-nbd-client 127.0.0.1 10810 /dev/nbd1  # 2GB device
-nbd-client 127.0.0.1 10811 /dev/nbd2  # 5GB device
+# Start ZeroFS
+zerofs run -c zerofs.toml
+
+# Mount ZeroFS via NFS or 9P to manage devices
+mount -t nfs 127.0.0.1:/ /mnt/zerofs
+# or
+mount -t 9p -o trans=tcp,port=5564 127.0.0.1 /mnt/zerofs
+
+# Create NBD devices dynamically
+mkdir -p /mnt/zerofs/.nbd
+truncate -s 1G /mnt/zerofs/.nbd/device1
+truncate -s 2G /mnt/zerofs/.nbd/device2
+truncate -s 5G /mnt/zerofs/.nbd/device3
+
+# Connect via TCP with optimal settings (high timeout, multiple connections)
+nbd-client 127.0.0.1 10809 /dev/nbd0 -N device1 -persist -timeout 600 -connections 4
+nbd-client 127.0.0.1 10809 /dev/nbd1 -N device2 -persist -timeout 600 -connections 4
+
+# Or connect via Unix socket (better local performance)
+nbd-client -unix /tmp/zerofs.nbd.sock /dev/nbd2 -N device3 -persist -timeout 600 -connections 4
 
 # Use the block devices
 mkfs.ext4 /dev/nbd0
@@ -180,56 +481,58 @@ zpool trim mypool
 
 When blocks are trimmed, ZeroFS removes the corresponding chunks from ZeroFS' LSM-tree, which eventually results in freed space in S3 storage through compaction. This reduces storage costs for any filesystem or application that issues TRIM commands.
 
-### NBD Device Files
+### NBD Device Management
 
-NBD devices appear as files in the `.nbd` directory when mounted via NFS:
-- `.nbd/device_10809` - 1GB device accessible on port 10809
-- `.nbd/device_10810` - 2GB device accessible on port 10810
-- `.nbd/device_10811` - 5GB device accessible on port 10811
+NBD devices are managed as regular files in the `.nbd` directory:
 
-You can read/write these files directly through NFS, or access them as block devices through NBD.
-
-**Important**: Once an NBD device is created with a specific size, the size cannot be changed. If you need to resize a device, you must delete the device file first:
 ```bash
-# Delete existing device and recreate with new size
-rm /mnt/zerofs/.nbd/device_10809
-# Then restart ZeroFS with the new size
+# List devices
+ls -lh /mnt/zerofs/.nbd/
+
+# Create a new device
+truncate -s 10G /mnt/zerofs/.nbd/my-device
+
+# Remove a device (must disconnect NBD client first)
+nbd-client -d /dev/nbd0
+rm /mnt/zerofs/.nbd/my-device
 ```
+
+Devices are discovered dynamically by the NBD server - no restart needed! You can read/write these files directly through NFS/9P, or access them as block devices through NBD.
 
 ## Geo-Distributed Storage with ZFS
 
 Since ZeroFS makes S3 regions look like local block devices, you can create globally distributed ZFS pools by running multiple ZeroFS instances across different regions:
 
 ```bash
-# Terminal 1 - US East
-ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
-AWS_DEFAULT_REGION=us-east-1 \
-ZEROFS_NBD_PORTS='10809' \
-ZEROFS_NBD_DEVICE_SIZES_GB='100' \
-zerofs s3://my-bucket/us-east-db
+# Machine 1 - US East (10.0.1.5)
+# zerofs-us-east.toml:
+# [storage]
+# url = "s3://my-bucket/us-east-db"
+# encryption_password = "${SHARED_KEY}"
+# [servers.nbd]
+# addresses = ["0.0.0.0:10809"]
+# [aws]
+# default_region = "us-east-1"
 
-# Terminal 2 - EU West
-ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
-AWS_DEFAULT_REGION=eu-west-1 \
-ZEROFS_NBD_PORTS='10810' \
-ZEROFS_NBD_DEVICE_SIZES_GB='100' \
-zerofs s3://my-bucket/eu-west-db
+zerofs run -c zerofs-us-east.toml
 
-# Terminal 3 - Asia Pacific
-ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
-AWS_DEFAULT_REGION=ap-southeast-1 \
-ZEROFS_NBD_PORTS='10811' \
-ZEROFS_NBD_DEVICE_SIZES_GB='100' \
-zerofs s3://my-bucket/asia-db
-```
+# Create device via mount (from same or another machine)
+mount -t nfs 10.0.1.5:/ /mnt/zerofs
+truncate -s 100G /mnt/zerofs/.nbd/storage
+umount /mnt/zerofs
 
-Then connect to all three NBD devices and create a geo-distributed ZFS pool:
+# Machine 2 - EU West (10.0.2.5)
+# Similar config with url = "s3://my-bucket/eu-west-db" and default_region = "eu-west-1"
+zerofs run -c zerofs-eu-west.toml
 
-```bash
-# Connect to NBD devices from each region
-nbd-client 127.0.0.1 10809 /dev/nbd0 -N device_10809  # US East
-nbd-client 127.0.0.2 10810 /dev/nbd1 -N device_10810  # EU West
-nbd-client 127.0.0.3 10811 /dev/nbd2 -N device_10811  # Asia Pacific
+# Machine 3 - Asia Pacific (10.0.3.5)
+# Similar config with url = "s3://my-bucket/asia-db" and default_region = "ap-southeast-1"
+zerofs run -c zerofs-asia.toml
+
+# From a client machine, connect to all three NBD devices with optimal settings
+nbd-client 10.0.1.5 10809 /dev/nbd0 -N storage -persist -timeout 600 -connections 8
+nbd-client 10.0.2.5 10809 /dev/nbd1 -N storage -persist -timeout 600 -connections 8
+nbd-client 10.0.3.5 10809 /dev/nbd2 -N storage -persist -timeout 600 -connections 8
 
 # Create a mirrored pool across continents using raw block devices
 zpool create global-pool mirror /dev/nbd0 /dev/nbd1 /dev/nbd2
@@ -353,106 +656,24 @@ These are standard pgbench runs with 50 concurrent clients. The underlying data 
         (us-east) (eu-west) (ap-south) (us-west) (eu-north) (ap-east)
 ```
 
-### CAP Theorem
+## Why NFS and 9P?
 
-[From Wikipedia](https://en.wikipedia.org/wiki/CAP_theorem)
+We support both NFS and 9P because they offer complementary advantages for network filesystems:
 
+**NFS** is supported everywhere - macOS, Linux, Windows, BSD - without requiring any additional software. The client-side kernel implementation is highly optimized, while our server can remain in userspace with full control over the storage backend. NFS's network-first design is a natural fit for remote object storage. The protocol handles disconnections, retries, and caching in ways that have been refined over decades of production use.
 
-> In database theory, the **CAP theorem**, also named **Brewer's theorem** after computer scientist Eric Brewer, states that any distributed data store can provide at most two of the following three guarantees:[1][2][3]
->
-> ### Consistency
->
-> Every read receives the most recent write or an error. Consistency as defined in the CAP theorem is quite different from the consistency guaranteed in ACID database transactions.[4]
->
-> ### Availability
->
-> Every request received by a non-failing node in the system must result in a response. This is the definition of availability in CAP theorem as defined by Gilbert and Lynch.[1] Availability as defined in CAP theorem is different from high availability in software architecture.[5]
->
-> ### Partition Tolerance
->
-> The system continues to operate despite an arbitrary number of messages being dropped (or delayed) by the network between nodes.
->
-> When a network partition failure happens, it must be decided whether to do one of the following:
->
-> - Cancel the operation and thus decrease the availability but ensure consistency
-> - Proceed with the operation and thus provide availability but risk inconsistency. This does not necessarily mean that system is highly available to its users.[5]
->
-> Thus, if there is a network partition, one has to choose between consistency or availability.
+**9P** provides superior performance and more accurate POSIX semantics, particularly for fsync/commit operations. Originally developed for Plan 9, it has a cleaner, simpler protocol design that's easier to implement correctly.
 
+Both protocols share key advantages over FUSE:
+- No custom kernel modules or drivers needed
+- Battle-tested client implementations in every OS
+- Network-first design ideal for remote storage
+- Built-in handling of disconnections and retries
+- Standard mounting and monitoring tools
 
-In an architecture that looks like
+With FUSE, we'd need to write both the filesystem implementation and a custom client driver to handle S3's network characteristics properly - latency, retries, caching strategies. NFS and 9P let us focus on what matters: building a great filesystem. The networking, caching, and client-side concerns are handled by mature implementations in every OS kernel.
 
-```
-  Client A ←→ Client B ←→ Client C
-     ↓           ↓           ↓
-     ├───────────┼───────────┤
-     ↓           ↓           ↓
-  PG Node 1   PG Node 2   PG Node 3
-     ↓           ↓           ↓
-     └───────────┼───────────┘
-                 ↓
-          Shared ZFS Pool
-                 ↓
-          Global ZeroFS
-```
-
-The architecture ensures only ONE node has read-write access at any time:
-
-1. Normal operation: Primary has ZFS mounted RW, standby unmounted.
-2. Partition detected: Client fences primary (ensures it can't write, through ZeroFS) by mounting the block devices, ZeroFS and then the pool.
-3. Client mounts ZFS RW on standby and starts PostgreSQL there
-4. If primary returns, it can't mount (ZeroFS will fence it, only a single writer is allowed )
-
-The client orchestrates exclusive access. There's never a moment where two nodes could write, because:
-
-- ZeroFS acquires exclusive access to the database
-- Fencing ensures the old primary can't suddenly start writing
-- The shared storage itself provides the coordination
-
-So we get:
-
-- Consistency: Only one writer exists at any moment
-- Availability: Client can always promote an accessible node
-- Partition tolerance: System continues despite network partition
-
-The "shared" in "shared ZFS pool" means shared access capability, not concurrent access.
-
-> Thus, if there is a network partition, one has to choose between consistency or availability.
-
-Even in a scenario where clients couldn't communicate due to a "client-wide" network partition - because they implement the same logic - would just route to the "new" primary.
-
-```
-[Clients 1,2] ← partition → [Clients 3,4]
-```
-
-The "network partition" in CAP assumes nodes can't coordinate. But if nodes don't NEED to coordinate because the storage layer handles it, then you've sidestepped the constraint.
-
-The theorem doesn't say:
-
-- HOW nodes must coordinate
-- That storage must be distributed
-- That you can't use locking primitives
-- That all coordination must be peer-to-peer
-
-So during a partition between database nodes:
-
-- Consistency: Only one writer via exclusive locking
-- Availability: Whichever node can reach ZeroFS can serve requests
-- Partition tolerance: System continues despite node-to-node partition
-
-It seems that CAP applies to a specific model of distributed systems, and if you change the model (shared storage arbitration instead of network consensus), different rules apply.
-
-If anyone has a rebutal for this please open an issue! :)
-
-## Why NFS?
-
-We chose NFS because it's supported everywhere - macOS, Linux, Windows, BSD - without requiring any additional software. The client-side kernel implementation is highly optimized, while our server can remain in userspace with full control over the storage backend.
-
-NFS's network-first design is a natural fit for remote object storage. The protocol handles disconnections, retries, and caching in ways that have been refined over decades of production use. Multi-client access, load balancing, and high availability are built into the ecosystem.
-
-With FUSE, we'd need to write both the filesystem implementation and a custom client driver to handle S3's network characteristics properly - latency, retries, caching strategies. NFS lets us focus on what matters: building a great filesystem. The networking, caching, and client-side concerns are handled by battle-tested NFS implementations in every OS kernel.
-
-For developers, this means you can mount ZeroFS using standard OS tools, monitor it with existing infrastructure, and debug issues with familiar utilities. It just works.
+For developers, this means you can mount ZeroFS using standard OS tools, monitor it with existing infrastructure, and debug issues with familiar utilities. Choose NFS for maximum compatibility, or 9P for maximum performance and POSIX FSYNC accuracy.
 
 
 ## Performance Benchmarks
@@ -487,6 +708,10 @@ These microsecond-level latencies are 4-5 orders of magnitude faster than raw S3
   <a href="https://asciinema.org/a/ovxTV0zTpjE1xcxn5CXehCTTN" target="_blank">View SQLite Benchmark Demo</a>
 </p>
 
+## ZeroFS vs JuiceFS
+
+[Benchmarks comparing ZeroFS to JuiceFS](https://www.zerofs.net/zerofs-vs-juicefs)
+
 ## Key Differences from S3FS
 
 ### 1. **Storage Architecture**
@@ -499,7 +724,7 @@ These microsecond-level latencies are 4-5 orders of magnitude faster than raw S3
 
 **ZeroFS:**
 - Uses SlateDB, a log-structured merge-tree (LSM) database
-- Files are chunked into 128KB blocks for efficient S3 operations
+- Files are chunked into 32K blocks for efficient S3 operations
 - Inodes and file data stored as key-value pairs
 - Metadata is first-class data in the database
 
@@ -533,8 +758,8 @@ s3://bucket/
 Key-Value Store:
 ├── inode:0 → {type: directory, entries: {...}}
 ├── inode:1 → {type: file, size: 1024, ...}
-├── chunk:1/0 → [first 128KB of file data]
-├── chunk:1/1 → [second 128KB of file data]
+├── chunk:1/0 → [first 32K of file data]
+├── chunk:1/1 → [second 32K of file data]
 └── next_inode_id → 2
 ```
 
@@ -555,7 +780,7 @@ Key-Value Store:
 ZeroFS is available as a GitHub Action for easy integration into your CI/CD workflows:
 
 ```yaml
-- uses: Barre/zerofs@v1
+- uses: Barre/zerofs@main
   with:
     object-store-url: 's3://bucket/path'
     encryption-password: ${{ secrets.ZEROFS_PASSWORD }}
@@ -565,6 +790,27 @@ ZeroFS is available as a GitHub Action for easy integration into your CI/CD work
 
 This enables persistent storage across workflow runs, shared artifacts between jobs, and more.
 
-## Future Enhancements
+## Filesystem Limits
 
-- [ ] Snapshot capabilities using SlateDB's checkpoints
+ZeroFS has the following theoretical limits:
+
+- **Maximum file size**: 16 EiB (16 exbibytes = 18.4 exabytes) per file
+- **Maximum number of files over filesystem lifespan**: 2^64 (~18 quintillion)
+- **Maximum hardlinks per file**: ~4 billion (2^32)
+- **Maximum filesystem size**: 2^112 bytes
+  - = 4,096 geopbytes (where 1 geopbyte = 2^100 bytes)
+  - = 4.3 million yottabytes
+  - = 4.4 billion zettabytes
+  - = 4.5 trillion exabytes
+
+These limits come from the filesystem design:
+- Inode IDs and file sizes are stored as 64-bit integers
+- The chunking system uses 32KB blocks with 64-bit indexing
+
+In practice, you'll encounter other constraints well before these theoretical limits, such as S3 provider limits, performance considerations with billions of objects, or simply running out of money.
+
+## Licensing
+
+ZeroFS is dual-licensed under GNU AGPL v3 and commercial licenses. The AGPL license is suitable for open source projects, while commercial licenses are available for organizations requiring different terms.
+
+For detailed licensing information, see our [Licensing Documentation](https://www.zerofs.net/licensing).

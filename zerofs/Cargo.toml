@@ -1,0 +1,78 @@
+[package]
+name = "zerofs"
+version = "0.20.0"
+edition = "2024"
+description = "A high-performance filesystem that makes S3 your primary storage with NFS, 9P, and NBD support"
+license = "AGPL-3.0"
+repository = "https://github.com/Barre/ZeroFS"
+homepage = "https://www.zerofs.net"
+documentation = "https://www.zerofs.net"
+readme = "../README.md"
+keywords = ["filesystem", "s3", "nfs", "distributed", "storage"]
+categories = ["filesystem", "network-programming"]
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1
+strip = true
+
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 16
+
+[dependencies]
+slatedb = { git = "https://github.com/slatedb/slatedb.git", rev = "d490e5ba5504851347aabb138316a068e9c3c419", features = [
+    "wal_disable",
+] }
+foyer-memory = "0.20.1"
+fastant = "0.1.11"
+tikv-jemallocator = { version = "0.6.1", features = ["background_threads"] }
+zerofs_nfsserve = "0.19.0"
+tokio = { version = "1.48", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+object_store = { version = "0.12.4", features = ["aws", "azure", "gcp"] }
+bytes = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
+rand = "0.8"
+futures = "0.3"
+chacha20poly1305 = "0.10"
+generic-array = "=0.14.7"
+hkdf = "0.12"
+sha2 = "0.10"
+lz4_flex = "0.12"
+anyhow = "1.0"
+arc-swap = "1.7"
+hex = "0.4"
+argon2 = "0.5"
+url = "2.5"
+deku = "0.20"
+thiserror = "2.0"
+comfy-table = "7.1"
+num-format = "0.4"
+libc = "0.2"
+dashmap = "6.1"
+uuid = { version = "1.17", features = ["v4"] }
+toml = "0.9"
+shellexpand = "3.1"
+clap = { version = "4.5", features = ["derive"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+tower = "0.5"
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
+chrono = "0.4"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+protobuf-src = "2"
+
+[dev-dependencies]
+tempfile = "3.21"
