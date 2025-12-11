@@ -412,8 +412,8 @@ pub async fn build_slatedb(
     let settings = slatedb::config::Settings {
         wal_enabled: false,
         l0_max_ssts,
-        l0_sst_size_bytes: 256 * 1024 * 1024,
-        filter_bits_per_key: 20,
+        l0_sst_size_bytes: 1024 * 1024 * 1024,
+        filter_bits_per_key: 10,
         object_store_cache_options: ObjectStoreCacheOptions {
             root_folder: Some(cache_config.root_folder.clone()),
             max_cache_size_bytes: Some(slatedb_object_cache_bytes),
