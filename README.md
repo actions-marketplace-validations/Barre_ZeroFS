@@ -155,6 +155,7 @@ The configuration file has sections for:
 - **Cache** - Local cache settings for performance
 - **Storage** - S3/Azure/local backend configuration and encryption
 - **Servers** - Enable/disable NFS, 9P, and NBD servers
+- **LSM tuning** - Write-ahead log, compaction, and flush settings
 - **Cloud credentials** - AWS or Azure authentication
 
 ### Example Configuration
@@ -184,12 +185,17 @@ unix_socket = "/tmp/zerofs.9p.sock"  # Optional
 addresses = ["127.0.0.1:10809"]
 unix_socket = "/tmp/zerofs.nbd.sock"  # Optional
 
+[lsm]
+wal_enabled = true  # WAL reduces compaction churn from frequent fsyncs (default: true)
+                    # Disable for bulk data loading where fsyncs are rare
+
 [aws]
 access_key_id = "${AWS_ACCESS_KEY_ID}"
 secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
 # endpoint = "https://s3.us-east-1.amazonaws.com"  # For S3-compatible services
 # default_region = "us-east-1"
 # allow_http = "true"  # For non-HTTPS endpoints
+# conditional_put = "redis://localhost:6379"  # For S3-compatible stores without conditional put support
 
 # [azure]
 # storage_account_name = "${AZURE_STORAGE_ACCOUNT_NAME}"
@@ -220,7 +226,10 @@ secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
 # endpoint = "https://s3.us-east-1.amazonaws.com"  # For S3-compatible services
 # default_region = "us-east-1"
 # allow_http = "true"  # For non-HTTPS endpoints (e.g., MinIO)
+# conditional_put = "redis://localhost:6379"  # For S3-compatible stores without conditional put support
 ```
+
+> **Note:** ZeroFS requires conditional write (put-if-not-exists) support for fencing. AWS S3 supports this natively. For S3-compatible object stores that do not support conditional puts, set `conditional_put` to a Redis URL. ZeroFS will use Redis to coordinate conditional write operations.
 
 #### Microsoft Azure
 ```toml
@@ -390,6 +399,20 @@ Both instances access the same object storage backend.
 
 The compactor uses the same configuration file and respects `[lsm].max_concurrent_compactions` for parallelism.
 
+### Separate WAL Object Store
+
+Every `fsync` writes to the WAL, so fsync latency equals the latency of the WAL's backing store. By default the WAL goes to the same S3 bucket as everything else. You can point it at a separate, lower-latency store instead — local NVMe, S3 Express One-Zone, a nearby S3-compatible service, etc.
+
+```toml
+[wal]
+url = "file:///mnt/nvme/zerofs-wal"
+```
+
+The `[wal]` section supports its own `[wal.aws]`, `[wal.azure]`, and `[wal.gcp]` credential blocks, independent from the main storage credentials. If no `[wal]` section is present, the WAL is written to the main object store.
+
+Whether you use a separate WAL store is decided at filesystem creation time. The underlying storage engine records this in its manifest, so you cannot add or remove a separate WAL store on an existing filesystem.
+
+You can move the WAL to a different location by updating the `[wal]` URL and credentials, but you must manually migrate the WAL files from the old store to the new one before starting ZeroFS.
 
 ### Encryption
 
@@ -747,7 +770,7 @@ These microsecond-level latencies are 4-5 orders of magnitude faster than raw S3
 - Multi-layered cache: Memory block cache, metadata cache, and configurable disk cache
 - Compression: Reduces data transfer and increases effective cache capacity
 - Parallel prefetching: Overlaps S3 requests to hide latency
-- Buffering through WAL + memtables: Batches writes to minimize S3 operations
+- Write-ahead log (WAL): Absorbs fsyncs without flushing the memtable, preventing small SST files and reducing compaction churn. Can be disabled for bulk loading workloads where fsyncs are rare
 
 <p align="center">
   <a href="https://asciinema.org/a/ovxTV0zTpjE1xcxn5CXehCTTN" target="_blank">View SQLite Benchmark Demo</a>

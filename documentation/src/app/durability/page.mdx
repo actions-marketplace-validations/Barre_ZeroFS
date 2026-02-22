@@ -132,7 +132,7 @@ ZeroFS requires no recovery procedure after unexpected termination.
 
     **Self-Describing State**: The database manifest describes the complete set of valid SST files. On startup, ZeroFS reads the manifest and has immediate access to the latest consistent state.
 
-    **No Write-Ahead Log Dependencies**: Unlike filesystems that require WAL replay to reconstruct state, ZeroFS state is fully materialized in SST files and the manifest.
+    **Write-Ahead Log (WAL)**: WAL is enabled by default to reduce compaction overhead from frequent fsyncs (see [Configuration Guide](/configuration) for details). Whether WAL is enabled or disabled does not affect durability guarantees. When enabled, any WAL entries since the last SST flush are replayed on startup — this only covers data not yet flushed to SSTs, so recovery remains fast.
 
   </Col>
   <Col>
@@ -364,6 +364,19 @@ This test validates data integrity through multiple filesystem layers and across
 | ZFS integration | NBD + 9P | Block device integrity across restarts |
 
 All tests run on every pull request and merge to the main branch.
+
+## Conditional Writes and Fencing
+
+ZeroFS uses conditional writes (put-if-not-exists) for fencing to prevent split-brain scenarios when multiple instances access the same storage backend. This ensures that only one writer can be active at a time.
+
+AWS S3, Azure Blob Storage, and Google Cloud Storage support conditional writes natively. For S3-compatible object stores that do not support conditional puts, ZeroFS can use Redis as a coordination backend:
+
+```toml
+[aws]
+conditional_put = "redis://localhost:6379"
+```
+
+When configured, ZeroFS uses Redis to coordinate conditional write operations, providing the same fencing guarantees as native conditional put support. See the [Configuration Guide](/configuration) for details.
 
 ## Backend Durability
 
