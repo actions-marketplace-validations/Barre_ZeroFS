@@ -16,12 +16,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use object_store::ClientConfigKey;
 use object_store::ClientOptions;
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path;
+use std::sync::Arc;
 use url::Url;
+
+const DEFAULT_USER_AGENT: &str = concat!(
+    "ZeroFS/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/Barre/ZeroFS)"
+);
+
+fn default_client_options() -> ClientOptions {
+    ClientOptions::default()
+        .with_timeout_disabled()
+        .with_config(ClientConfigKey::UserAgent, DEFAULT_USER_AGENT)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -175,25 +189,69 @@ where
     let path = Path::parse(path)?;
 
     let store: Box<dyn ObjectStore> = match scheme {
-        ObjectStoreScheme::Local => Box::new(LocalFileSystem::new()),
+        // `with_fsync(true)` makes a successful write durable on disk before it
+        // returns, matching the implicit contract of the cloud backends
+        ObjectStoreScheme::Local => Box::new(LocalFileSystem::new().with_fsync(true)),
         ObjectStoreScheme::Memory => Box::new(InMemory::new()),
         ObjectStoreScheme::AmazonS3 => {
-            let builder = options.into_iter().fold(
-                object_store::aws::AmazonS3Builder::new()
+            // Collect options so we can intercept an external conditional-put
+            // coordinator (a `redis://...` URL) before it reaches the builder, which
+            // only understands `etag`/`disabled`. The HEAD+PUT coordination is
+            // provided one layer up by RedisConditionalStore instead, so the
+            // inner store can stay vanilla `object_store`.
+            let mut opts: Vec<(String, String)> = options
+                .into_iter()
+                .map(|(k, v)| (k.as_ref().to_string(), v.into()))
+                .collect();
+
+            let mut commit_url: Option<String> = None;
+            opts.retain(|(k, v)| {
+                let is_conditional_put = k
+                    .parse::<object_store::aws::AmazonS3ConfigKey>()
+                    .is_ok_and(|key| {
+                        matches!(key, object_store::aws::AmazonS3ConfigKey::ConditionalPut)
+                    });
+                if is_conditional_put && (v.starts_with("redis://") || v.starts_with("rediss://")) {
+                    commit_url = Some(v.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+
+            // When coordinating externally, the inner store must never emit
+            // precondition headers so we serialise HEAD+PUT under the lock instead.
+            if commit_url.is_some() {
+                opts.push(("conditional_put".to_string(), "disabled".to_string()));
+            }
+
+            let builder = opts.into_iter().fold(
+                object_store::aws::AmazonS3Builder::from_env()
                     .with_url(url.to_string())
-                    .with_client_options(ClientOptions::default().with_timeout_disabled()),
-                |builder, (key, value)| match key.as_ref().parse() {
+                    .with_client_options(default_client_options()),
+                |builder, (key, value)| match key.parse() {
                     Ok(k) => builder.with_config(k, value),
                     Err(_) => builder,
                 },
             );
-            Box::new(builder.build()?)
+            let inner = builder.build()?;
+
+            match commit_url {
+                Some(redis_url) => {
+                    let commit = crate::redis_conditional_store::RedisCommit::new(redis_url)?;
+                    Box::new(crate::redis_conditional_store::RedisConditionalStore::new(
+                        Arc::new(inner),
+                        Arc::new(commit),
+                    ))
+                }
+                None => Box::new(inner),
+            }
         }
         ObjectStoreScheme::GoogleCloudStorage => {
             let builder = options.into_iter().fold(
-                object_store::gcp::GoogleCloudStorageBuilder::new()
+                object_store::gcp::GoogleCloudStorageBuilder::from_env()
                     .with_url(url.to_string())
-                    .with_client_options(ClientOptions::default().with_timeout_disabled()),
+                    .with_client_options(default_client_options()),
                 |builder, (key, value)| match key.as_ref().parse() {
                     Ok(k) => builder.with_config(k, value),
                     Err(_) => builder,
@@ -203,9 +261,9 @@ where
         }
         ObjectStoreScheme::MicrosoftAzure => {
             let builder = options.into_iter().fold(
-                object_store::azure::MicrosoftAzureBuilder::new()
+                object_store::azure::MicrosoftAzureBuilder::from_env()
                     .with_url(url.to_string())
-                    .with_client_options(ClientOptions::default().with_timeout_disabled()),
+                    .with_client_options(default_client_options()),
                 |builder, (key, value)| match key.as_ref().parse() {
                     Ok(k) => builder.with_config(k, value),
                     Err(_) => builder,

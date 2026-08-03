@@ -5,10 +5,12 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
 pub mod checkpoint;
-pub mod compactor;
 pub mod debug;
 pub mod fatrace;
 pub mod flush;
+mod init;
+pub mod monitor;
+pub mod otrace;
 pub mod password;
 pub mod server;
 
@@ -24,6 +26,7 @@ pub struct Cli {
 pub enum Commands {
     /// Generate a default configuration file
     Init {
+        /// Output path for the config file, or "-" to write to stdout
         #[arg(default_value = "zerofs.toml")]
         path: PathBuf,
     },
@@ -37,9 +40,6 @@ pub enum Commands {
         /// Open from a specific checkpoint by name (read-only mode)
         #[arg(long, conflicts_with = "read_only")]
         checkpoint: Option<String>,
-        /// Run without the built-in compactor (use with external compactor)
-        #[arg(long)]
-        no_compactor: bool,
     },
     /// Change the encryption password
     ///
@@ -67,11 +67,8 @@ pub enum Commands {
         #[arg(short, long)]
         config: PathBuf,
     },
-    /// Run standalone compactor for the database
-    ///
-    /// Use this to run compaction on a separate instance from the writer.
-    /// The writer should be started with --no-compactor flag.
-    Compactor {
+    /// Trace object store requests in real-time
+    Otrace {
         #[arg(short, long)]
         config: PathBuf,
     },
@@ -79,6 +76,57 @@ pub enum Commands {
     Flush {
         #[arg(short, long)]
         config: PathBuf,
+    },
+    /// Monitor filesystem activity in real-time
+    Monitor {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Stats refresh interval in milliseconds
+        #[arg(long, default_value = "250")]
+        interval: u32,
+    },
+    /// Mount a ZeroFS 9P export as a local filesystem (FUSE client)
+    ///
+    /// Connects to a running ZeroFS 9P server and exposes it at a local mount
+    /// point. The server may be local or remote. Examples:
+    ///
+    /// zerofs mount 127.0.0.1:5564 /mnt/zerofs
+    ///
+    /// zerofs mount unix:/tmp/zerofs.9p.sock /mnt/zerofs
+    #[cfg(target_os = "linux")]
+    Mount {
+        /// 9P server address: host[:port], tcp://host:port, or unix:/path/to.sock
+        target: String,
+        /// Local directory to mount at
+        mountpoint: PathBuf,
+        /// Mount read-only
+        #[arg(long)]
+        read_only: bool,
+        /// Who may access the mount: `owner` (only the mounting user), `root`
+        /// (owner + root), or `all` (any user). `root`/`all` need
+        /// `user_allow_other` in /etc/fuse.conf unless mounting as root.
+        #[arg(long, value_enum, default_value_t = crate::mount::MountAccess::Owner)]
+        access: crate::mount::MountAccess,
+        /// Maximum 9P message size in bytes
+        #[arg(long, default_value_t = 10 * 1024 * 1024)]
+        msize: u32,
+        /// Use a writeback page cache: writes are buffered and flushed
+        /// asynchronously (higher throughput, looser cross-client coherence).
+        /// Pass `--writeback false` to write through synchronously instead.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        writeback: bool,
+        /// Allow consistency-relaxing client/kernel caches for speed: the
+        /// open+read prefetch fold, cached symlink targets, a 1s attribute cache,
+        /// and page-cached reads. Pass `--relaxed-consistency false` for strict
+        /// consistency, where every read and lookup hits the server (direct I/O,
+        /// no attribute cache) and writes are synchronous (implies write-through).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        relaxed_consistency: bool,
+        /// Root the mount at this server-side directory (a path from the
+        /// filesystem root, e.g. /volumes/pvc-1) instead of the whole
+        /// filesystem. The directory must already exist.
+        #[arg(long)]
+        aname: Option<String>,
     },
 }
 

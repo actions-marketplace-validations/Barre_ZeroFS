@@ -17,8 +17,10 @@ mod tests {
         Credentials {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             groups: [1000; 16],
             groups_count: 1,
+            groups_complete: true,
         }
     }
 
@@ -113,7 +115,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (a_id, _) = fs
@@ -146,7 +150,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (file1_id, _) = fs
@@ -197,7 +203,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (parent_id, _) = fs
@@ -229,7 +237,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (dir_id, _) = fs
@@ -278,7 +288,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (file_id, _) = fs
@@ -333,7 +345,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (tmp_id, _) = fs
@@ -407,7 +421,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let file_id = fs
@@ -428,7 +444,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (dir_id, _) = fs
@@ -476,7 +494,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (dir1_id, _) = fs
@@ -526,7 +546,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (file_id, _) = fs
@@ -534,26 +556,26 @@ mod tests {
             .await
             .unwrap();
 
-        let chunk_size = 128 * 1024;
-        let test_data: Vec<u8> = (0..chunk_size).map(|i| (i % 256) as u8).collect();
+        let extent_size = 128 * 1024;
+        let test_data: Vec<u8> = (0..extent_size).map(|i| (i % 256) as u8).collect();
 
         fs.write(&auth, file_id, 0, &bytes::Bytes::from(test_data.clone()))
             .await
             .unwrap();
 
         let (data1, _) = fs
-            .read_file(&auth, file_id, 0, chunk_size as u32)
+            .read_file(&auth, file_id, 0, extent_size as u32)
             .await
             .unwrap();
         assert_eq!(data1, test_data);
 
-        let offset = chunk_size as u64 - 100;
+        let offset = extent_size as u64 - 100;
         let (data2, _) = fs.read_file(&auth, file_id, offset, 200).await.unwrap();
         assert_eq!(data2.len(), 100);
         assert_eq!(&data2[..], &test_data[offset as usize..]);
 
         let (data3, eof) = fs
-            .read_file(&auth, file_id, chunk_size as u64, 100)
+            .read_file(&auth, file_id, extent_size as u64, 100)
             .await
             .unwrap();
         assert_eq!(data3.len(), 0);
@@ -589,7 +611,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (file_id, _) = fs
@@ -669,13 +693,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_trim_on_fully_sparse_file() {
+        let fs = create_test_fs().await;
+        let creds = test_creds();
+        let auth = AuthContext {
+            uid: 1000,
+            gid: 1000,
+            gid_known: true,
+            gids: vec![1000],
+            groups_complete: true,
+        };
+
+        let (file_id, _) = fs
+            .create(&creds, 0, b"sparse.img", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        fs.setattr(
+            &creds,
+            file_id,
+            &SetAttributes {
+                size: SetSize::Set(50 * 1024 * 1024),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        fs.trim(&auth, file_id, 0, 1024)
+            .await
+            .expect("trim on sparse file must succeed");
+    }
+
+    #[tokio::test]
     async fn test_sparse_file_operations() {
         let fs = create_test_fs().await;
         let creds = test_creds();
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (file_id, _) = fs
@@ -710,7 +769,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (src_id, _) = fs
@@ -785,7 +846,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (file_id, _) = fs
@@ -828,7 +891,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (a_id, _) = fs
@@ -922,7 +987,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         // Create file 'a'
@@ -1026,7 +1093,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
         fs.rename(&auth, dir2_id, b"dir3", 0, b"moved_dir3")
             .await
@@ -1063,7 +1132,9 @@ mod tests {
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
+                gid_known: true,
                 gids: vec![1000],
+                groups_complete: true,
             },
             file_id,
             0,
@@ -1098,7 +1169,9 @@ mod tests {
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
+                gid_known: true,
                 gids: vec![1000],
+                groups_complete: true,
             },
             file_id,
             0,
@@ -1111,7 +1184,9 @@ mod tests {
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
+                gid_known: true,
                 gids: vec![1000],
+                groups_complete: true,
             },
             0,
             b"hardlink.txt",
@@ -1145,7 +1220,9 @@ mod tests {
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
+                gid_known: true,
                 gids: vec![1000],
+                groups_complete: true,
             },
             file_id,
             0,
@@ -1158,7 +1235,9 @@ mod tests {
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
+                gid_known: true,
                 gids: vec![1000],
+                groups_complete: true,
             },
             0,
             b"hardlink.txt",
@@ -1175,7 +1254,9 @@ mod tests {
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
+                gid_known: true,
                 gids: vec![1000],
+                groups_complete: true,
             },
             0,
             b"original.txt",
@@ -1211,7 +1292,9 @@ mod tests {
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
+                gid_known: true,
                 gids: vec![1000],
+                groups_complete: true,
             },
             file_id,
             0,
@@ -1229,7 +1312,9 @@ mod tests {
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
+                gid_known: true,
                 gids: vec![1000],
+                groups_complete: true,
             },
             0,
             b"original.txt",
@@ -1257,8 +1342,10 @@ mod tests {
         let owner_creds = Credentials {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             groups: [1000; 16],
             groups_count: 1,
+            groups_complete: true,
         };
 
         let (dir_id, _) = fs
@@ -1283,7 +1370,9 @@ mod tests {
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
+                gid_known: true,
                 gids: vec![1000],
+                groups_complete: true,
             },
             file_id,
             0,
@@ -1307,7 +1396,9 @@ mod tests {
                 &AuthContext {
                     uid: 2000,
                     gid: 2000,
+                    gid_known: true,
                     gids: vec![2000],
+                    groups_complete: true,
                 },
                 file_id,
                 0,
@@ -1331,14 +1422,26 @@ mod tests {
                 SlateDbHandle::ReadWrite(Arc::new(
                     slatedb::DbBuilder::new(
                         slatedb::object_store::path::Path::from("test_quota"),
-                        object_store,
+                        object_store.clone(),
                     )
                     .with_block_transformer(block_transformer)
+                    .with_filter_policies(crate::fs::filter_policy::filter_policies())
+                    .with_segment_extractor(Arc::new(
+                        crate::segment_extractor::ZeroFsSegmentExtractor,
+                    ))
                     .build()
                     .await
                     .unwrap(),
                 )),
                 1_000_000,
+                None,
+                false,
+                object_store,
+                crate::frame_codec::FrameCodec::new(
+                    &test_key,
+                    crate::segment::SEGMENT_INFO,
+                    CompressionConfig::default(),
+                ),
             )
             .await
             .unwrap(),
@@ -1348,7 +1451,9 @@ mod tests {
         let auth = AuthContext {
             uid: creds.uid,
             gid: creds.gid,
+            gid_known: true,
             gids: vec![],
+            groups_complete: true,
         };
 
         let (file_id, _) = fs
@@ -1389,14 +1494,26 @@ mod tests {
                 SlateDbHandle::ReadWrite(Arc::new(
                     slatedb::DbBuilder::new(
                         slatedb::object_store::path::Path::from("test_quota_setattr"),
-                        object_store,
+                        object_store.clone(),
                     )
                     .with_block_transformer(block_transformer)
+                    .with_filter_policies(crate::fs::filter_policy::filter_policies())
+                    .with_segment_extractor(Arc::new(
+                        crate::segment_extractor::ZeroFsSegmentExtractor,
+                    ))
                     .build()
                     .await
                     .unwrap(),
                 )),
                 1_000_000,
+                None,
+                false,
+                object_store,
+                crate::frame_codec::FrameCodec::new(
+                    &test_key,
+                    crate::segment::SEGMENT_INFO,
+                    CompressionConfig::default(),
+                ),
             )
             .await
             .unwrap(),
@@ -1444,14 +1561,26 @@ mod tests {
                 SlateDbHandle::ReadWrite(Arc::new(
                     slatedb::DbBuilder::new(
                         slatedb::object_store::path::Path::from("test_quota_over"),
-                        object_store,
+                        object_store.clone(),
                     )
                     .with_block_transformer(block_transformer)
+                    .with_filter_policies(crate::fs::filter_policy::filter_policies())
+                    .with_segment_extractor(Arc::new(
+                        crate::segment_extractor::ZeroFsSegmentExtractor,
+                    ))
                     .build()
                     .await
                     .unwrap(),
                 )),
                 1_000_000,
+                None,
+                false,
+                object_store,
+                crate::frame_codec::FrameCodec::new(
+                    &test_key,
+                    crate::segment::SEGMENT_INFO,
+                    CompressionConfig::default(),
+                ),
             )
             .await
             .unwrap(),
@@ -1461,7 +1590,9 @@ mod tests {
         let auth = AuthContext {
             uid: creds.uid,
             gid: creds.gid,
+            gid_known: true,
             gids: vec![],
+            groups_complete: true,
         };
 
         let (file_id, _) = fs
@@ -1496,7 +1627,9 @@ mod tests {
         let auth = AuthContext {
             uid: creds.uid,
             gid: creds.gid,
+            gid_known: true,
             gids: vec![],
+            groups_complete: true,
         };
 
         let (file_id, _) = fs

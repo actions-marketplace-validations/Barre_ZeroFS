@@ -15,6 +15,29 @@ pub enum FileType {
     BlockDevice,
 }
 
+/// Filesystem-level fallocate operations supported by ZeroFS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallocateMode {
+    /// Reserve quota and grow the logical file size when the range crosses EOF.
+    Allocate,
+    /// Deallocate the range without changing the logical file size.
+    PunchHole,
+    /// Make the range read as zero, optionally preserving the logical file size.
+    ZeroRange { keep_size: bool },
+}
+
+impl FallocateMode {
+    /// Linux fallocate mode bits used in traces and on the private 9P wire.
+    pub const fn linux_mode(self) -> u32 {
+        match self {
+            Self::Allocate => 0,
+            Self::PunchHole => 0x01 | 0x02,
+            Self::ZeroRange { keep_size: false } => 0x10,
+            Self::ZeroRange { keep_size: true } => 0x10 | 0x01,
+        }
+    }
+}
+
 impl From<FileType> for ftype3 {
     fn from(ft: FileType) -> Self {
         match ft {
@@ -341,11 +364,27 @@ pub struct ReadDirResult {
 }
 
 /// Protocol-agnostic authentication context
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AuthContext {
     pub uid: u32,
     pub gid: u32,
+    pub gid_known: bool,
     pub gids: Vec<u32>,
+    /// False only when group DAC was already checked before this context was
+    /// created and the complete supplementary-group list was unavailable.
+    pub groups_complete: bool,
+}
+
+impl Default for AuthContext {
+    fn default() -> Self {
+        Self {
+            uid: 0,
+            gid: 0,
+            gid_known: true,
+            gids: Vec::new(),
+            groups_complete: true,
+        }
+    }
 }
 
 impl From<&zerofs_nfsserve::vfs::AuthContext> for AuthContext {
@@ -353,7 +392,9 @@ impl From<&zerofs_nfsserve::vfs::AuthContext> for AuthContext {
         Self {
             uid: auth.uid,
             gid: auth.gid,
+            gid_known: true,
             gids: auth.gids.clone(),
+            groups_complete: true,
         }
     }
 }
@@ -363,7 +404,9 @@ impl From<&super::permissions::Credentials> for AuthContext {
         Self {
             uid: creds.uid,
             gid: creds.gid,
+            gid_known: creds.gid_known,
             gids: creds.groups[..creds.groups_count].to_vec(),
+            groups_complete: creds.groups_complete,
         }
     }
 }

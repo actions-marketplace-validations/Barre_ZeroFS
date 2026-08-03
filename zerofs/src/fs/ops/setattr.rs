@@ -1,0 +1,970 @@
+//! setattr: mode/owner/size/times in one guarded update.
+
+#[cfg(feature = "failpoints")]
+use crate::failpoints as fp;
+#[cfg(feature = "failpoints")]
+use fp::fail_point;
+
+use crate::dedup::DedupResult;
+use crate::fs::errors::FsError;
+use crate::fs::inode::{Inode, InodeAttrs, InodeId};
+use crate::fs::permissions::{
+    AccessMode, Credentials, can_set_times, check_access, check_ownership, validate_mode,
+};
+use crate::fs::stats;
+use crate::fs::tracing::FileOperation;
+use crate::fs::types::{
+    FileAttributes, InodeWithId, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid,
+};
+use crate::fs::{ZeroFS, get_current_time};
+use ::tracing::debug;
+use std::sync::atomic::Ordering;
+
+enum SizeAuthorization {
+    CurrentMode,
+    OpenedWritableFid,
+}
+
+impl ZeroFS {
+    /// Persist an automatic access-time update without changing ctime or
+    /// requiring the reader to own the file.
+    #[allow(dead_code)] // Used by the binary-only 9P handler.
+    pub(crate) async fn record_access_time_idempotent(
+        &self,
+        id: InodeId,
+        atime: crate::fs::types::Timestamp,
+        op_id: crate::dedup::OpId,
+    ) -> Result<FileAttributes, FsError> {
+        if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_setattr)? {
+            return Ok(result);
+        }
+        let _guard = self.lock_manager.acquire(id).await;
+        if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_setattr)? {
+            return Ok(result);
+        }
+
+        let mut inode = self.inode_store.get(id).await?;
+        let file = match &mut inode {
+            Inode::File(file) => file,
+            _ => return Err(FsError::InvalidArgument),
+        };
+        let changed = (file.atime, file.atime_nsec) < (atime.seconds, atime.nanoseconds);
+        if changed {
+            file.atime = atime.seconds;
+            file.atime_nsec = atime.nanoseconds;
+        }
+
+        let post_attrs: FileAttributes = InodeWithId { inode: &inode, id }.into();
+        let mut txn = self.db.new_transaction()?;
+        if changed {
+            self.inode_store.save(&mut txn, id, &inode)?;
+            if let Some(parent_id) = inode.parent()
+                && let Some(name) = inode.name()
+            {
+                self.directory_store
+                    .update_inode_in_entry(&mut txn, parent_id, name, id, &inode)
+                    .await?;
+            }
+        }
+        txn.set_dedup_result(
+            op_id,
+            DedupResult::Setattr {
+                attrs: post_attrs.clone(),
+            },
+        );
+        self.write_coordinator.commit(txn).await?;
+        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+        Ok(post_attrs)
+    }
+
+    /// Attribute update behind POSIX gates: chmod needs ownership; chown needs
+    /// root (an owner may chgrp within their groups); explicit timestamps need
+    /// `can_set_times`. A size change goes through the extent store: shrink
+    /// drops extents, growth is a sparse size bump.
+    pub async fn setattr(
+        &self,
+        creds: &Credentials,
+        id: InodeId,
+        setattr: &SetAttributes,
+    ) -> Result<FileAttributes, FsError> {
+        self.setattr_idempotent(creds, id, setattr, [0u8; 16]).await
+    }
+
+    /// Idempotent setattr retaining the original post-operation attributes.
+    /// A delayed truncate retry does not affect later writes.
+    pub async fn setattr_idempotent(
+        &self,
+        creds: &Credentials,
+        id: InodeId,
+        setattr: &SetAttributes,
+        op_id: crate::dedup::OpId,
+    ) -> Result<FileAttributes, FsError> {
+        self.setattr_idempotent_inner(creds, id, setattr, op_id, SizeAuthorization::CurrentMode)
+            .await
+    }
+
+    /// Idempotent setattr through a fid whose write access was authorized at
+    /// open. Only the mutable mode-bit check for a size change is skipped;
+    /// ownership and timestamp authorization remain enforced.
+    #[allow(dead_code)] // Used by the binary-only 9P handler.
+    pub(crate) async fn setattr_opened_idempotent(
+        &self,
+        creds: &Credentials,
+        id: InodeId,
+        setattr: &SetAttributes,
+        op_id: crate::dedup::OpId,
+    ) -> Result<FileAttributes, FsError> {
+        self.setattr_idempotent_inner(
+            creds,
+            id,
+            setattr,
+            op_id,
+            SizeAuthorization::OpenedWritableFid,
+        )
+        .await
+    }
+
+    async fn setattr_idempotent_inner(
+        &self,
+        creds: &Credentials,
+        id: InodeId,
+        setattr: &SetAttributes,
+        op_id: crate::dedup::OpId,
+        size_authorization: SizeAuthorization,
+    ) -> Result<FileAttributes, FsError> {
+        if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_setattr)? {
+            return Ok(result);
+        }
+        debug!(
+            "setattr: id={}, setattr={:?}, creds=(uid={}, gid={}, groups={:?})",
+            id,
+            setattr,
+            creds.uid,
+            creds.gid,
+            &creds.groups[..creds.groups_count]
+        );
+        let _guard = self.lock_manager.acquire(id).await;
+        // A same-id call may have completed while this one waited for the inode
+        // lock (direct filesystem callers do not pass through the 9P single-flight).
+        if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_setattr)? {
+            return Ok(result);
+        }
+        let mut inode = self.inode_store.get(id).await?;
+
+        // For chmod (mode change), must be owner
+        if matches!(setattr.mode, SetMode::Set(_)) {
+            check_ownership(&inode, creds)?;
+        }
+
+        // For chown/chgrp, must be root (or owner with restrictions)
+        let changing_uid = matches!(&setattr.uid, SetUid::Set(_));
+        let changing_gid = matches!(&setattr.gid, SetGid::Set(_));
+
+        if (changing_uid || changing_gid) && creds.uid != 0 {
+            debug!(
+                "setattr: non-root chown attempt: creds.uid={}, inode.uid={}, changing_uid={}, changing_gid={}, setattr.uid={:?}, setattr.gid={:?}",
+                creds.uid,
+                inode.uid(),
+                changing_uid,
+                changing_gid,
+                setattr.uid,
+                setattr.gid
+            );
+            check_ownership(&inode, creds)?;
+
+            if let SetUid::Set(new_uid) = setattr.uid
+                && new_uid != creds.uid
+            {
+                debug!(
+                    "setattr: denied uid change from {} to {} by non-root user {}",
+                    inode.uid(),
+                    new_uid,
+                    creds.uid
+                );
+                return Err(FsError::OperationNotPermitted);
+            }
+
+            // POSIX: Owner can change group to any group they belong to
+            if let SetGid::Set(new_gid) = setattr.gid
+                && !creds.is_member_of_group(new_gid)
+            {
+                debug!(
+                    "setattr: denied gid change to {} - user {} is not a member of that group",
+                    new_gid, creds.uid
+                );
+                return Err(FsError::OperationNotPermitted);
+            }
+        }
+
+        match setattr.atime {
+            SetTime::SetToClientTime(_) => {
+                can_set_times(&inode, creds, false)?;
+            }
+            SetTime::SetToServerTime => {
+                can_set_times(&inode, creds, true)?;
+            }
+            SetTime::NoChange => {}
+        }
+        match setattr.mtime {
+            SetTime::SetToClientTime(_) => {
+                can_set_times(&inode, creds, false)?;
+            }
+            SetTime::SetToServerTime => {
+                can_set_times(&inode, creds, true)?;
+            }
+            SetTime::NoChange => {}
+        }
+
+        if matches!(size_authorization, SizeAuthorization::CurrentMode)
+            && matches!(setattr.size, SetSize::Set(_))
+        {
+            check_access(&inode, creds, AccessMode::Write)?;
+        }
+
+        match &mut inode {
+            Inode::File(file) => {
+                let size_change = if let SetSize::Set(new_size) = setattr.size {
+                    let old_size = file.size;
+                    if new_size != old_size {
+                        if new_size > old_size {
+                            let size_increase = new_size - old_size;
+                            let (used_bytes, _) = self.global_stats.get_totals();
+                            if used_bytes.saturating_add(size_increase) > self.max_bytes {
+                                debug!(
+                                    "Setattr size change would exceed quota: used={}, increase={}, max={}",
+                                    used_bytes, size_increase, self.max_bytes
+                                );
+                                return Err(FsError::NoSpace);
+                            }
+                        }
+
+                        file.size = new_size;
+                        let (now_sec, now_nsec) = get_current_time();
+                        file.mtime = now_sec;
+                        file.mtime_nsec = now_nsec;
+                        file.ctime = now_sec;
+                        file.ctime_nsec = now_nsec;
+                        Some((old_size, new_size))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let SetMode::Set(mode) = setattr.mode {
+                    debug!("Setting file mode from {} to {:#o}", file.mode, mode);
+                    file.mode = validate_mode(mode);
+                    // POSIX: If non-root user sets mode with setgid bit and doesn't belong to file's group, clear setgid
+                    if creds.uid != 0
+                        && (file.mode & 0o2000) != 0
+                        && !creds.is_member_of_group(file.gid)
+                    {
+                        file.mode &= !0o2000;
+                    }
+                }
+                if let SetUid::Set(uid) = setattr.uid {
+                    file.uid = uid;
+                    if creds.uid != 0 {
+                        file.mode &= !0o4000;
+                    }
+                }
+                if let SetGid::Set(gid) = setattr.gid {
+                    file.gid = gid;
+                    // Clear SUID/SGID bits when non-root user calls chown with a gid
+                    // This happens even if the gid doesn't actually change (POSIX behavior)
+                    if creds.uid != 0 {
+                        file.mode &= !0o6000;
+                    }
+                }
+                match setattr.atime {
+                    SetTime::SetToClientTime(t) => {
+                        file.atime = t.seconds;
+                        file.atime_nsec = t.nanoseconds;
+                    }
+                    SetTime::SetToServerTime => {
+                        let (now_sec, now_nsec) = get_current_time();
+                        file.atime = now_sec;
+                        file.atime_nsec = now_nsec;
+                    }
+                    SetTime::NoChange => {}
+                }
+                match setattr.mtime {
+                    SetTime::SetToClientTime(t) => {
+                        file.mtime = t.seconds;
+                        file.mtime_nsec = t.nanoseconds;
+                    }
+                    SetTime::SetToServerTime => {
+                        let (now_sec, now_nsec) = get_current_time();
+                        file.mtime = now_sec;
+                        file.mtime_nsec = now_nsec;
+                    }
+                    SetTime::NoChange => {}
+                }
+
+                let attribute_changed = matches!(setattr.mode, SetMode::Set(_))
+                    || matches!(setattr.uid, SetUid::Set(_))
+                    || matches!(setattr.gid, SetGid::Set(_))
+                    || matches!(setattr.size, SetSize::Set(_))
+                    || matches!(
+                        setattr.atime,
+                        SetTime::SetToClientTime(_) | SetTime::SetToServerTime
+                    )
+                    || matches!(
+                        setattr.mtime,
+                        SetTime::SetToClientTime(_) | SetTime::SetToServerTime
+                    );
+
+                if attribute_changed {
+                    let (now_sec, now_nsec) = get_current_time();
+                    file.ctime = now_sec;
+                    file.ctime_nsec = now_nsec;
+                }
+
+                // A size change must commit the extent update, every other
+                // requested attribute, the directory-entry snapshot, and the
+                // idempotency result in one transaction. In particular, do
+                // not return through the truncate path before applying
+                // mode/owner/timestamp fields.
+                if let Some((old_size, new_size)) = size_change {
+                    let parent_name_for_update = file.parent.zip(file.name.clone());
+                    let mut txn = self.db.new_transaction()?;
+
+                    self.extent_store
+                        .truncate(&mut txn, id, old_size, new_size)
+                        .await?;
+
+                    #[cfg(feature = "failpoints")]
+                    fail_point!(fp::TRUNCATE_AFTER_EXTENTS);
+
+                    self.inode_store.save(&mut txn, id, &inode)?;
+
+                    #[cfg(feature = "failpoints")]
+                    fail_point!(fp::TRUNCATE_AFTER_INODE);
+
+                    if let Some((parent_id, name)) = parent_name_for_update {
+                        self.directory_store
+                            .update_inode_in_entry(&mut txn, parent_id, &name, id, &inode)
+                            .await?;
+                    }
+
+                    let post_attrs: FileAttributes = InodeWithId { inode: &inode, id }.into();
+                    txn.set_dedup_result(
+                        op_id,
+                        crate::dedup::DedupResult::Setattr {
+                            attrs: post_attrs.clone(),
+                        },
+                    );
+                    txn.add_stats_delta(id, stats::size_delta(old_size, new_size), 0);
+
+                    self.write_coordinator.commit(txn).await?;
+
+                    #[cfg(feature = "failpoints")]
+                    fail_point!(fp::TRUNCATE_AFTER_COMMIT);
+
+                    self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
+                    self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
+                    self.tracer.emit(
+                        &self.inode_store,
+                        id,
+                        FileOperation::Setattr {
+                            mode: match setattr.mode {
+                                SetMode::Set(m) => Some(m),
+                                SetMode::NoChange => None,
+                            },
+                        },
+                    );
+
+                    return Ok(post_attrs);
+                }
+            }
+            Inode::Directory(dir) => {
+                if let SetMode::Set(mode) = setattr.mode {
+                    debug!("Setting directory mode from {} to {:#o}", dir.mode, mode);
+                    dir.mode = validate_mode(mode);
+                    // POSIX: If non-root user sets mode with setgid bit and doesn't belong to directory's group, clear setgid
+                    if creds.uid != 0
+                        && (dir.mode & 0o2000) != 0
+                        && !creds.is_member_of_group(dir.gid)
+                    {
+                        dir.mode &= !0o2000;
+                    }
+                }
+                if let SetUid::Set(uid) = setattr.uid {
+                    dir.uid = uid;
+                    if creds.uid != 0 {
+                        dir.mode &= !0o4000;
+                    }
+                }
+                if let SetGid::Set(gid) = setattr.gid {
+                    dir.gid = gid;
+                    // Clear SUID/SGID bits when non-root user calls chown with a gid
+                    // This happens even if the gid doesn't actually change (POSIX behavior)
+                    if creds.uid != 0 {
+                        dir.mode &= !0o6000;
+                    }
+                }
+                match setattr.atime {
+                    SetTime::SetToClientTime(t) => {
+                        dir.atime = t.seconds;
+                        dir.atime_nsec = t.nanoseconds;
+                    }
+                    SetTime::SetToServerTime => {
+                        let (now_sec, now_nsec) = get_current_time();
+                        dir.atime = now_sec;
+                        dir.atime_nsec = now_nsec;
+                    }
+                    SetTime::NoChange => {}
+                }
+                match setattr.mtime {
+                    SetTime::SetToClientTime(t) => {
+                        dir.mtime = t.seconds;
+                        dir.mtime_nsec = t.nanoseconds;
+                    }
+                    SetTime::SetToServerTime => {
+                        let (now_sec, now_nsec) = get_current_time();
+                        dir.mtime = now_sec;
+                        dir.mtime_nsec = now_nsec;
+                    }
+                    SetTime::NoChange => {}
+                }
+
+                let attribute_changed = matches!(setattr.mode, SetMode::Set(_))
+                    || matches!(setattr.uid, SetUid::Set(_))
+                    || matches!(setattr.gid, SetGid::Set(_))
+                    || matches!(
+                        setattr.atime,
+                        SetTime::SetToClientTime(_) | SetTime::SetToServerTime
+                    )
+                    || matches!(
+                        setattr.mtime,
+                        SetTime::SetToClientTime(_) | SetTime::SetToServerTime
+                    );
+
+                if attribute_changed {
+                    let (now_sec, now_nsec) = get_current_time();
+                    dir.ctime = now_sec;
+                    dir.ctime_nsec = now_nsec;
+                }
+            }
+            Inode::Symlink(symlink) => {
+                if let SetMode::Set(mode) = setattr.mode {
+                    symlink.mode = validate_mode(mode);
+                }
+                if let SetUid::Set(uid) = setattr.uid {
+                    symlink.uid = uid;
+                    if creds.uid != 0 {
+                        symlink.mode &= !0o4000;
+                    }
+                }
+                if let SetGid::Set(gid) = setattr.gid {
+                    symlink.gid = gid;
+                    if creds.uid != 0 {
+                        symlink.mode &= !0o6000;
+                    }
+                }
+                match setattr.atime {
+                    SetTime::SetToClientTime(t) => {
+                        symlink.atime = t.seconds;
+                        symlink.atime_nsec = t.nanoseconds;
+                    }
+                    SetTime::SetToServerTime => {
+                        let (now_sec, now_nsec) = get_current_time();
+                        symlink.atime = now_sec;
+                        symlink.atime_nsec = now_nsec;
+                    }
+                    SetTime::NoChange => {}
+                }
+                match setattr.mtime {
+                    SetTime::SetToClientTime(t) => {
+                        symlink.mtime = t.seconds;
+                        symlink.mtime_nsec = t.nanoseconds;
+                    }
+                    SetTime::SetToServerTime => {
+                        let (now_sec, now_nsec) = get_current_time();
+                        symlink.mtime = now_sec;
+                        symlink.mtime_nsec = now_nsec;
+                    }
+                    SetTime::NoChange => {}
+                }
+
+                let attribute_changed = matches!(setattr.mode, SetMode::Set(_))
+                    || matches!(setattr.uid, SetUid::Set(_))
+                    || matches!(setattr.gid, SetGid::Set(_))
+                    || matches!(
+                        setattr.atime,
+                        SetTime::SetToClientTime(_) | SetTime::SetToServerTime
+                    )
+                    || matches!(
+                        setattr.mtime,
+                        SetTime::SetToClientTime(_) | SetTime::SetToServerTime
+                    );
+
+                if attribute_changed {
+                    let (now_sec, now_nsec) = get_current_time();
+                    symlink.ctime = now_sec;
+                    symlink.ctime_nsec = now_nsec;
+                }
+            }
+            Inode::Fifo(special)
+            | Inode::Socket(special)
+            | Inode::CharDevice(special)
+            | Inode::BlockDevice(special) => {
+                if let SetMode::Set(mode) = setattr.mode {
+                    special.mode = validate_mode(mode);
+                }
+                if let SetUid::Set(uid) = setattr.uid {
+                    special.uid = uid;
+                    if creds.uid != 0 {
+                        special.mode &= !0o4000;
+                    }
+                }
+                if let SetGid::Set(gid) = setattr.gid {
+                    special.gid = gid;
+                    if creds.uid != 0 {
+                        special.mode &= !0o6000;
+                    }
+                }
+                match setattr.atime {
+                    SetTime::SetToClientTime(t) => {
+                        special.atime = t.seconds;
+                        special.atime_nsec = t.nanoseconds;
+                    }
+                    SetTime::SetToServerTime => {
+                        let (sec, nsec) = get_current_time();
+                        special.atime = sec;
+                        special.atime_nsec = nsec;
+                    }
+                    _ => {}
+                }
+                match setattr.mtime {
+                    SetTime::SetToClientTime(t) => {
+                        special.mtime = t.seconds;
+                        special.mtime_nsec = t.nanoseconds;
+                    }
+                    SetTime::SetToServerTime => {
+                        let (sec, nsec) = get_current_time();
+                        special.mtime = sec;
+                        special.mtime_nsec = nsec;
+                    }
+                    _ => {}
+                }
+
+                let attribute_changed = matches!(setattr.mode, SetMode::Set(_))
+                    || matches!(setattr.uid, SetUid::Set(_))
+                    || matches!(setattr.gid, SetGid::Set(_))
+                    || matches!(
+                        setattr.atime,
+                        SetTime::SetToClientTime(_) | SetTime::SetToServerTime
+                    )
+                    || matches!(
+                        setattr.mtime,
+                        SetTime::SetToClientTime(_) | SetTime::SetToServerTime
+                    );
+
+                if attribute_changed {
+                    let (now_sec, now_nsec) = get_current_time();
+                    special.ctime = now_sec;
+                    special.ctime_nsec = now_nsec;
+                }
+            }
+        }
+
+        let mut txn = self.db.new_transaction()?;
+        self.inode_store.save(&mut txn, id, &inode)?;
+
+        if let Some(parent_id) = inode.parent()
+            && let Some(name) = inode.name()
+        {
+            self.directory_store
+                .update_inode_in_entry(&mut txn, parent_id, name, id, &inode)
+                .await?;
+        }
+
+        let post_attrs: FileAttributes = InodeWithId { inode: &inode, id }.into();
+        txn.set_dedup_result(
+            op_id,
+            crate::dedup::DedupResult::Setattr {
+                attrs: post_attrs.clone(),
+            },
+        );
+
+        self.write_coordinator.commit(txn).await?;
+
+        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
+        self.tracer.emit(
+            &self.inode_store,
+            id,
+            FileOperation::Setattr {
+                mode: match setattr.mode {
+                    SetMode::Set(m) => Some(m),
+                    SetMode::NoChange => None,
+                },
+            },
+        );
+
+        Ok(post_attrs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use crate::fs::errors::FsError;
+    use crate::fs::permissions::Credentials;
+    use crate::fs::test_util::test_creds;
+    use crate::fs::*;
+    use crate::test_helpers::test_helpers_mod::test_auth;
+
+    use crate::fs::types::{
+        AuthContext, FileAttributes, InodeWithId, SetAttributes, SetGid, SetMode, SetSize, SetTime,
+        SetUid, Timestamp,
+    };
+    use bytes::Bytes;
+
+    #[tokio::test]
+    async fn test_process_setattr_file_size() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"test.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        fs.write(
+            &(&test_auth()).into(),
+            file_id,
+            0,
+            &Bytes::from(vec![b'A'; 1000]),
+        )
+        .await
+        .unwrap();
+
+        let setattr = SetAttributes {
+            size: SetSize::Set(500),
+            ..Default::default()
+        };
+
+        let fattr = fs.setattr(&test_creds(), file_id, &setattr).await.unwrap();
+        assert_eq!(fattr.size, 500);
+        let same_size = fs.setattr(&test_creds(), file_id, &setattr).await.unwrap();
+        assert_eq!(same_size.size, fattr.size);
+
+        let (read_data, _) = fs
+            .read_file(&(&test_auth()).into(), file_id, 0, 1000)
+            .await
+            .unwrap();
+        assert_eq!(read_data.len(), 500);
+    }
+
+    #[tokio::test]
+    async fn access_time_update_is_monotonic_and_replayable_without_ctime_change() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (file_id, created) = fs
+            .create(
+                &test_creds(),
+                0,
+                b"access-time.txt",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+        let first = Timestamp {
+            seconds: created.atime.seconds + 10,
+            nanoseconds: 100,
+        };
+        let second = Timestamp {
+            seconds: first.seconds + 10,
+            nanoseconds: 200,
+        };
+        let first_op = [0x81; 16];
+
+        let original = fs
+            .record_access_time_idempotent(file_id, first, first_op)
+            .await
+            .unwrap();
+        assert_eq!(original.atime, first);
+        assert_eq!(original.ctime, created.ctime);
+
+        let newer = fs
+            .record_access_time_idempotent(file_id, second, [0x82; 16])
+            .await
+            .unwrap();
+        assert_eq!(newer.atime, second);
+        assert_eq!(newer.ctime, created.ctime);
+
+        let stale = fs
+            .record_access_time_idempotent(file_id, first, [0x83; 16])
+            .await
+            .unwrap();
+        assert_eq!(stale.atime, second);
+        assert_eq!(stale.ctime, created.ctime);
+
+        let replayed = fs
+            .record_access_time_idempotent(file_id, first, first_op)
+            .await
+            .unwrap();
+        assert_eq!(replayed.atime, original.atime);
+        assert_eq!(replayed.ctime, original.ctime);
+
+        let inode = fs.inode_store.get(file_id).await.unwrap();
+        let persisted: FileAttributes = InodeWithId {
+            inode: &inode,
+            id: file_id,
+        }
+        .into();
+        assert_eq!(persisted.atime, second);
+        assert_eq!(persisted.ctime, created.ctime);
+    }
+
+    #[tokio::test]
+    async fn opened_truncate_remains_authorized_after_chmod() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
+        let (file_id, _) = fs
+            .create(&creds, 0, b"opened-truncate.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        let auth = AuthContext::from(&creds);
+        fs.write(&auth, file_id, 0, &Bytes::from(vec![b'A'; 1000]))
+            .await
+            .unwrap();
+
+        fs.setattr(
+            &creds,
+            file_id,
+            &SetAttributes {
+                mode: SetMode::Set(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let truncate = SetAttributes {
+            size: SetSize::Set(500),
+            ..Default::default()
+        };
+        let error = fs.setattr(&creds, file_id, &truncate).await.unwrap_err();
+        assert_eq!(
+            error,
+            FsError::PermissionDenied,
+            "ordinary setattr must still use the inode's current mode"
+        );
+
+        let attrs = fs
+            .setattr_opened_idempotent(&creds, file_id, &truncate, [0; 16])
+            .await
+            .unwrap();
+        assert_eq!(attrs.size, 500);
+        let (data, _) = fs.read_file_opened(file_id, 0, 1000).await.unwrap();
+        assert_eq!(data.len(), 500);
+    }
+
+    #[tokio::test]
+    async fn opened_setattr_still_enforces_ownership_atomically() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let owner = test_creds();
+        let (file_id, _) = fs
+            .create(
+                &owner,
+                0,
+                b"opened-size-only.txt",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+        fs.setattr(
+            &owner,
+            file_id,
+            &SetAttributes {
+                mode: SetMode::Set(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let non_owner = Credentials {
+            uid: owner.uid + 1,
+            gid: owner.gid + 1,
+            gid_known: true,
+            groups: [0; 16],
+            groups_count: 0,
+            groups_complete: true,
+        };
+        let result = fs
+            .setattr_opened_idempotent(
+                &non_owner,
+                file_id,
+                &SetAttributes {
+                    mode: SetMode::Set(0o600),
+                    size: SetSize::Set(100),
+                    ..Default::default()
+                },
+                [0; 16],
+            )
+            .await;
+        assert_eq!(result.unwrap_err(), FsError::OperationNotPermitted);
+
+        let inode = fs.inode_store.get(file_id).await.unwrap();
+        let attrs: FileAttributes = InodeWithId {
+            inode: &inode,
+            id: file_id,
+        }
+        .into();
+        assert_eq!(attrs.mode, 0);
+        assert_eq!(attrs.size, 0);
+    }
+
+    #[tokio::test]
+    async fn truncate_retry_replays_result_without_destroying_a_later_write() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"retry.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        let auth = (&test_auth()).into();
+        fs.write(&auth, file_id, 0, &Bytes::from_static(b"old"))
+            .await
+            .unwrap();
+        let truncate = SetAttributes {
+            size: SetSize::Set(0),
+            ..Default::default()
+        };
+        let op_id = [0x42; 16];
+
+        let original = fs
+            .setattr_idempotent(&test_creds(), file_id, &truncate, op_id)
+            .await
+            .unwrap();
+        fs.write(&auth, file_id, 0, &Bytes::from_static(b"new"))
+            .await
+            .unwrap();
+
+        let replayed = fs
+            .setattr_idempotent(&test_creds(), file_id, &truncate, op_id)
+            .await
+            .unwrap();
+        assert_eq!(original.size, 0);
+        assert_eq!(replayed.size, 0, "retry returns the original exact stat");
+        let (data, _) = fs.read_file(&auth, file_id, 0, 3).await.unwrap();
+        assert_eq!(data.as_ref(), b"new", "retry must not truncate again");
+    }
+
+    #[tokio::test]
+    async fn combined_truncate_and_metadata_commit_and_replay_together() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"combined.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        let auth = (&test_auth()).into();
+        fs.write(&auth, file_id, 0, &Bytes::from(vec![b'A'; 1000]))
+            .await
+            .unwrap();
+
+        let root = Credentials {
+            uid: 0,
+            gid: 0,
+            gid_known: true,
+            groups: [0; 16],
+            groups_count: 0,
+            groups_complete: true,
+        };
+        let atime = Timestamp {
+            seconds: 1_234_567_890,
+            nanoseconds: 123_456_789,
+        };
+        let mtime = Timestamp {
+            seconds: 1_345_678_901,
+            nanoseconds: 234_567_890,
+        };
+        let combined = SetAttributes {
+            mode: SetMode::Set(0o6754),
+            uid: SetUid::Set(2001),
+            gid: SetGid::Set(2002),
+            size: SetSize::Set(500),
+            atime: SetTime::SetToClientTime(atime),
+            mtime: SetTime::SetToClientTime(mtime),
+        };
+        let op_id = [0x71; 16];
+
+        let original = fs
+            .setattr_idempotent(&root, file_id, &combined, op_id)
+            .await
+            .unwrap();
+        assert_eq!(original.size, 500);
+        assert_eq!(original.mode, 0o6754);
+        assert_eq!(original.uid, 2001);
+        assert_eq!(original.gid, 2002);
+        assert_eq!(original.atime, atime);
+        assert_eq!(original.mtime, mtime);
+
+        let persisted_inode = fs.inode_store.get(file_id).await.unwrap();
+        let persisted: FileAttributes = InodeWithId {
+            inode: &persisted_inode,
+            id: file_id,
+        }
+        .into();
+        assert_eq!(persisted.size, original.size);
+        assert_eq!(persisted.mode, original.mode);
+        assert_eq!(persisted.uid, original.uid);
+        assert_eq!(persisted.gid, original.gid);
+        assert_eq!(persisted.atime, original.atime);
+        assert_eq!(persisted.mtime, original.mtime);
+        let (data, eof) = fs
+            .read_file(&AuthContext::from(&root), file_id, 0, 1000)
+            .await
+            .unwrap();
+        assert_eq!(data.len(), 500);
+        assert!(eof);
+
+        // Move every field away from the original result. Replaying the
+        // combined operation must return its retained post-op stat without
+        // truncating or restoring metadata over these later changes.
+        let later_atime = Timestamp {
+            seconds: 2_000_000_000,
+            nanoseconds: 1,
+        };
+        let later_mtime = Timestamp {
+            seconds: 2_000_000_001,
+            nanoseconds: 2,
+        };
+        let later = SetAttributes {
+            mode: SetMode::Set(0o600),
+            uid: SetUid::Set(3001),
+            gid: SetGid::Set(3002),
+            size: SetSize::Set(750),
+            atime: SetTime::SetToClientTime(later_atime),
+            mtime: SetTime::SetToClientTime(later_mtime),
+        };
+        fs.setattr(&root, file_id, &later).await.unwrap();
+
+        let replayed = fs
+            .setattr_idempotent(&root, file_id, &combined, op_id)
+            .await
+            .unwrap();
+        assert_eq!(replayed.size, original.size);
+        assert_eq!(replayed.mode, original.mode);
+        assert_eq!(replayed.uid, original.uid);
+        assert_eq!(replayed.gid, original.gid);
+        assert_eq!(replayed.atime, original.atime);
+        assert_eq!(replayed.mtime, original.mtime);
+
+        let current_inode = fs.inode_store.get(file_id).await.unwrap();
+        let current: FileAttributes = InodeWithId {
+            inode: &current_inode,
+            id: file_id,
+        }
+        .into();
+        assert_eq!(current.size, 750);
+        assert_eq!(current.mode, 0o600);
+        assert_eq!(current.uid, 3001);
+        assert_eq!(current.gid, 3002);
+        assert_eq!(current.atime, later_atime);
+        assert_eq!(current.mtime, later_mtime);
+    }
+}

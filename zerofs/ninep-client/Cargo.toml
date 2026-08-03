@@ -1,0 +1,44 @@
+[package]
+name = "ninep-client"
+version = "0.2.0"
+edition = "2024"
+description = "Async 9P2000.L client with transparent reconnection"
+license = "AGPL-3.0"
+repository = "https://github.com/Barre/ZeroFS"
+homepage = "https://www.zerofs.net"
+documentation = "https://docs.rs/ninep-client"
+keywords = ["9p", "9p2000l", "client", "async", "reconnect"]
+categories = ["network-programming", "filesystem", "asynchronous"]
+
+[dependencies]
+# Path for local/CI resolution; version so crates.io accepts the dependency.
+# The transport crates are on their own pre-1.0 line, independent of the server.
+ninep-proto = { path = "../ninep-proto", version = "0.2.0" }
+tokio = { version = "1.52", features = ["sync", "macros"] }
+futures = "0.3"
+dashmap = "6.2"
+arc-swap = "1.9"
+deku = "0.20"
+bytes = "1.11"
+tracing = "0.1"
+uuid = { version = "1.24", features = ["v4"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+libc = "0.2"
+tokio = { version = "1.52", features = ["rt", "net", "io-util", "time"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+socket2 = { version = "0.6", features = ["all"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+gloo-timers = { version = "0.3", features = ["futures"] }
+uuid = { version = "1.24", features = ["js"] }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "BinaryType",
+    "Event",
+    "MessageEvent",
+    "Performance",
+    "WebSocket",
+] }

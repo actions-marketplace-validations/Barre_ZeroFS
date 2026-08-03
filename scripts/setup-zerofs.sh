@@ -13,12 +13,6 @@ case "$OS-$ARCH" in
     linux-aarch64|linux-arm64)
         BINARY_NAME="zerofs-linux-arm64-pgo"
         ;;
-    linux-armv7*)
-        BINARY_NAME="zerofs-linux-armv7-pgo"
-        ;;
-    linux-i686)
-        BINARY_NAME="zerofs-linux-i686-pgo"
-        ;;
     darwin-x86_64|darwin-amd64)
         BINARY_NAME="zerofs-darwin-x86_64-pgo"
         ;;
@@ -135,6 +129,18 @@ storage_account_name = "$AZURE_STORAGE_ACCOUNT_NAME"
 storage_account_key = "$AZURE_STORAGE_ACCOUNT_KEY"
 EOF
 fi
+
+# GitHub turns every unset optional input into an empty-string env var. ZeroFS
+# seeds the object_store builder from the environment.
+for var in $(compgen -e); do
+    case "$var" in
+        AWS_*|AZURE_*|GOOGLE_*)
+            if [ -z "${!var:-}" ]; then
+                unset "$var"
+            fi
+            ;;
+    esac
+done
 
 nohup /usr/local/bin/zerofs run -c zerofs-action.toml > zerofs.log 2>&1 &
 ZEROFS_PID=$!

@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
-use zerofs::fs::CHUNK_SIZE;
+use zerofs::fs::EXTENT_SIZE;
 use zerofs_nfsserve::nfs::{
     FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_LINK, FSF_SYMLINK, fattr3, fileid3, filename3, fsinfo3,
     fsstat3, ftype3, nfspath3, nfsstat3, nfstime3, post_op_attr, sattr3, specdata3, writeverf3,
@@ -347,13 +347,12 @@ impl NFSFileSystem for NFSAdapter {
             count
         );
 
-        match self.fs.flush_coordinator.flush().await {
+        match self.fs.client_fsync().await {
             Ok(_) => {
                 debug!("commit successful for file {}", fileid);
                 self.fs
                     .tracer
-                    .emit(|| self.fs.resolve_path_lossy(fileid), FileOperation::Fsync)
-                    .await;
+                    .emit(&self.fs.inode_store, fileid, FileOperation::Fsync);
                 Ok(self.serverid())
             }
             Err(fs_error) => {
@@ -384,10 +383,10 @@ impl NFSFileSystem for NFSAdapter {
             obj_attributes: obj_attr,
             rtmax: 1024 * 1024,
             rtpref: 1024 * 1024,
-            rtmult: CHUNK_SIZE as u32,
+            rtmult: EXTENT_SIZE as u32,
             wtmax: 1024 * 1024,
             wtpref: 1024 * 1024,
-            wtmult: CHUNK_SIZE as u32,
+            wtmult: EXTENT_SIZE as u32,
             dtpref: 1024 * 1024,
             maxfilesize,
             time_delta: nfstime3 {
@@ -411,9 +410,10 @@ impl NFSFileSystem for NFSAdapter {
 
         let (used_bytes, used_inodes) = self.fs.global_stats.get_totals();
 
-        let next_inode_id = self.fs.inode_store.next_id();
-        let available_inodes = u64::MAX.saturating_sub(next_inode_id);
-        let total_inodes = used_inodes + available_inodes;
+        // Fixed, signed-safe inode capacity (see fs::TOTAL_INODES): a u64::MAX-based
+        // count renders negative under GNU `stat`/`df`. `available` = capacity - in-use.
+        let total_inodes = crate::fs::TOTAL_INODES;
+        let available_inodes = total_inodes.saturating_sub(used_inodes);
 
         // Use configured max_bytes from filesystem config, capped at 8 EiB
         // to avoid breaking NFS clients that can't handle larger values
@@ -442,7 +442,9 @@ pub async fn start_nfs_server_with_config(
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let adapter = NFSAdapter::new(filesystem);
-    let listener = NFSTcpListener::bind(socket, adapter).await?;
+    let listener = NFSTcpListener::bind(socket, adapter)
+        .await
+        .map_err(|e| crate::net_util::tcp_bind_error("NFS", socket, &e))?;
 
     info!("NFS server listening on {}", socket);
 

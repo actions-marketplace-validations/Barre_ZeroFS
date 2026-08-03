@@ -3,21 +3,42 @@ use std::io::BufRead;
 
 mod block_transformer;
 mod bucket_identity;
-mod cache;
 mod checkpoint_manager;
 mod cli;
 mod config;
 mod db;
-mod deku_bytes;
+mod dedup;
+mod frame_codec;
 mod fs;
 mod key_management;
+mod length_checked_object_store;
+mod metadata_digest;
+#[cfg(target_os = "linux")]
+mod mount;
 mod nbd;
+mod net_util;
 mod nfs;
 mod ninep;
+mod object_store_prefetch;
+mod object_trace;
 mod parse_object_store;
+mod prometheus;
+mod redis_conditional_store;
+mod replication;
+mod retrying_object_store;
 mod rpc;
+mod segment;
+mod segment_extractor;
+mod segment_store;
+mod storage_class_object_store;
 mod storage_compatibility;
 mod task;
+mod telemetry;
+#[cfg(feature = "webui")]
+mod webui;
+
+#[cfg(test)]
+mod fault_store;
 
 #[cfg(test)]
 mod test_helpers;
@@ -25,24 +46,43 @@ mod test_helpers;
 #[cfg(test)]
 mod posix_tests;
 
+#[cfg(test)]
+mod zerofs_client_tests;
+
 #[cfg(feature = "failpoints")]
 mod failpoints;
 
-use mimalloc::MiMalloc;
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
 
+#[cfg(not(target_env = "msvc"))]
 #[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+static GLOBAL: Jemalloc = Jemalloc;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .enable_eager_driver_handoff()
+        .build()
+        .context("Failed to build Tokio runtime")?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let cli = cli::Cli::parse_args();
 
     match cli.command {
         cli::Commands::Init { path } => {
-            println!("Generating configuration file at: {}", path.display());
-            config::Settings::write_default_config(&path)?;
-            println!("Configuration file created successfully!");
-            println!("Edit the file and run: zerofs run -c {}", path.display());
+            if path.to_str() == Some("-") {
+                // Write the config to stdout so it can be piped or redirected, e.g.:
+                //   docker run --rm ghcr.io/barre/zerofs:latest init - > zerofs.toml
+                print!("{}", config::Settings::render_default_config()?);
+            } else {
+                eprintln!("Generating configuration file at: {}", path.display());
+                config::Settings::write_default_config(&path)?;
+                eprintln!("Configuration file created successfully!");
+                eprintln!("Edit the file and run: zerofs run -c {}", path.display());
+            }
         }
         cli::Commands::ChangePassword { config } => {
             let settings = match config::Settings::from_file(&config) {
@@ -80,9 +120,11 @@ async fn main() -> Result<()> {
             config,
             read_only,
             checkpoint,
-            no_compactor,
         } => {
-            cli::server::run_server(config, read_only, checkpoint, no_compactor).await?;
+            if let Err(e) = cli::server::run_server(config, read_only, checkpoint).await {
+                eprintln!("✗ Error: {:#}", e);
+                std::process::exit(1);
+            }
         }
         cli::Commands::Debug { subcommand } => match subcommand {
             cli::DebugCommands::ListKeys { config } => {
@@ -106,11 +148,38 @@ async fn main() -> Result<()> {
         cli::Commands::Fatrace { config } => {
             cli::fatrace::run_fatrace(config).await?;
         }
-        cli::Commands::Compactor { config } => {
-            cli::compactor::run_compactor(config).await?;
+        cli::Commands::Otrace { config } => {
+            cli::otrace::run_otrace(config).await?;
         }
         cli::Commands::Flush { config } => {
             cli::flush::flush(&config).await?;
+        }
+        cli::Commands::Monitor { config, interval } => {
+            cli::monitor::run_monitor(config, interval).await?;
+        }
+        #[cfg(target_os = "linux")]
+        cli::Commands::Mount {
+            target,
+            mountpoint,
+            read_only,
+            access,
+            msize,
+            writeback,
+            relaxed_consistency,
+            aname,
+        } => {
+            let opts = mount::MountOptions {
+                msize,
+                read_only,
+                access,
+                writeback,
+                relaxed_consistency,
+                aname: aname.unwrap_or_default(),
+            };
+            if let Err(e) = mount::run(target, mountpoint, opts).await {
+                eprintln!("✗ Error: {:#}", e);
+                std::process::exit(1);
+            }
         }
     }
 

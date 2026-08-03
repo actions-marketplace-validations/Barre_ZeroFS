@@ -1,0 +1,220 @@
+# e2e variant of deploy/gateway-example.yaml: same names, labels and ports, so
+# deploy/storageclass-example.yaml applies verbatim. Differences from the deploy
+# manifest:
+#   - S3 storage on an in-cluster MinIO (minio.yaml), shared by both nodes. The
+#     two nodes replicate over one store (one bucket prefix), and the data
+#     survives a leader pod deletion (which the failover test depends on).
+#   - the locally imported image.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: zerofs
+---
+# ----- node A (config role: leader) -----
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zerofs-gateway-a-config
+  namespace: zerofs
+data:
+  zerofs.toml: |
+    [cache]
+    dir = "/cache"
+    disk_size_gb = 1.0
+
+    [storage]
+    url = "s3://zerofs-csi/db"
+    encryption_password = "zerofs-e2e-password"
+
+    [aws]
+    endpoint = "http://minio.zerofs.svc.cluster.local:9000"
+    access_key_id = "minioadmin"
+    secret_access_key = "minioadmin"
+    allow_http = "true"
+
+    [servers]
+
+    [servers.ninep]
+    addresses = ["0.0.0.0:5564"]
+
+    [servers.rpc]
+    addresses = ["0.0.0.0:7000"]
+
+    [replication]
+    node_id = "node-a"
+    role = "leader"
+    replication_listen = "0.0.0.0:9000"
+    peers = ["zerofs-gateway-b.zerofs.svc:9000"]
+
+    [telemetry]
+    enabled = false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zerofs-gateway-a
+  namespace: zerofs
+spec:
+  selector:
+    app: zerofs-gateway
+    node: node-a
+  ports:
+    - name: ninep
+      port: 5564
+    - name: admin
+      port: 7000
+    - name: repl
+      port: 9000
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: zerofs-gateway-a
+  namespace: zerofs
+spec:
+  serviceName: zerofs-gateway-a
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zerofs-gateway
+      node: node-a
+  template:
+    metadata:
+      labels:
+        app: zerofs-gateway
+        node: node-a
+    spec:
+      containers:
+        - name: zerofs
+          image: docker.io/library/zerofs:e2e
+          imagePullPolicy: Never
+          args: ["run", "-c", "/etc/zerofs/zerofs.toml"]
+          ports:
+            - name: ninep
+              containerPort: 5564
+            - name: admin
+              containerPort: 7000
+            - name: repl
+              containerPort: 9000
+          # Ready when the replication port accepts, which both roles bind early
+          # (the standby binds 9P only after it takes over). Gating on 9P would
+          # drop the standby from its Service and cut off the leader's ships.
+          readinessProbe:
+            tcpSocket:
+              port: repl
+            periodSeconds: 2
+            timeoutSeconds: 1
+          volumeMounts:
+            - name: config
+              mountPath: /etc/zerofs
+            - name: cache
+              mountPath: /cache
+      volumes:
+        - name: config
+          configMap:
+            name: zerofs-gateway-a-config
+        - name: cache
+          emptyDir: {}
+---
+# ----- node B (config role: standby) -----
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zerofs-gateway-b-config
+  namespace: zerofs
+data:
+  zerofs.toml: |
+    [cache]
+    dir = "/cache"
+    disk_size_gb = 1.0
+
+    [storage]
+    url = "s3://zerofs-csi/db"
+    encryption_password = "zerofs-e2e-password"
+
+    [aws]
+    endpoint = "http://minio.zerofs.svc.cluster.local:9000"
+    access_key_id = "minioadmin"
+    secret_access_key = "minioadmin"
+    allow_http = "true"
+
+    [servers]
+
+    [servers.ninep]
+    addresses = ["0.0.0.0:5564"]
+
+    [servers.rpc]
+    addresses = ["0.0.0.0:7000"]
+
+    [replication]
+    node_id = "node-b"
+    role = "standby"
+    replication_listen = "0.0.0.0:9000"
+    peers = ["zerofs-gateway-a.zerofs.svc:9000"]
+
+    [telemetry]
+    enabled = false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zerofs-gateway-b
+  namespace: zerofs
+spec:
+  selector:
+    app: zerofs-gateway
+    node: node-b
+  ports:
+    - name: ninep
+      port: 5564
+    - name: admin
+      port: 7000
+    - name: repl
+      port: 9000
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: zerofs-gateway-b
+  namespace: zerofs
+spec:
+  serviceName: zerofs-gateway-b
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zerofs-gateway
+      node: node-b
+  template:
+    metadata:
+      labels:
+        app: zerofs-gateway
+        node: node-b
+    spec:
+      containers:
+        - name: zerofs
+          image: docker.io/library/zerofs:e2e
+          imagePullPolicy: Never
+          args: ["run", "-c", "/etc/zerofs/zerofs.toml"]
+          ports:
+            - name: ninep
+              containerPort: 5564
+            - name: admin
+              containerPort: 7000
+            - name: repl
+              containerPort: 9000
+          readinessProbe:
+            tcpSocket:
+              port: repl
+            periodSeconds: 2
+            timeoutSeconds: 1
+          volumeMounts:
+            - name: config
+              mountPath: /etc/zerofs
+            - name: cache
+              mountPath: /cache
+      volumes:
+        - name: config
+          configMap:
+            name: zerofs-gateway-b-config
+        - name: cache
+          emptyDir: {}

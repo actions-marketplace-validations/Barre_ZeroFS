@@ -5,7 +5,7 @@ import { HeroPattern } from '@/components/HeroPattern'
 export const metadata = {
   title: 'ZeroFS Documentation',
   description:
-    'The filesystem that makes S3 your primary storage. Mount S3 buckets as local filesystems with NFS or 9P or use them as block devices with NBD.',
+    'ZeroFS exposes object storage through filesystem mounts, client libraries, and NBD block devices.',
 }
 
 export const sections = [
@@ -17,7 +17,7 @@ export const sections = [
 
 # ZeroFS Documentation
 
-ZeroFS makes S3 storage feel like a real filesystem. It provides file-level access via NFS and 9P and block-level access via NBD. Fast enough to compile code on, with clients already built into your OS. No FUSE drivers, no kernel modules, just mount and go.
+ZeroFS exposes S3-compatible, Azure Blob Storage, or Google Cloud Storage through filesystem mounts and NBD block devices. Stock NFS and Linux 9P clients need no ZeroFS-specific software. On supported Linux kernels, the [native kernel client](/kernel-client) is the fastest mount option; the bundled FUSE client works across a wider range and mounts without root. The server itself runs in userspace.
 
 <div className="not-prose mt-6 mb-16 flex gap-3">
   <Button href="/quickstart" arrow="right">
@@ -28,9 +28,14 @@ ZeroFS makes S3 storage feel like a real filesystem. It provides file-level acce
   </Button>
 </div>
 
-## Why ZeroFS? {{ anchor: false }}
+## What ZeroFS does {{ anchor: false }}
 
-Traditional filesystems are limited by local storage capacity and hardware constraints. ZeroFS breaks these limitations by turning S3 into a high-performance filesystem that's always encrypted, globally accessible, and infinitely scalable. Run databases, compile code, or even boot entire operating systems directly from S3 storage. {{ className: 'lead' }}
+ZeroFS keeps filesystem data and metadata in the configured object store and uses local disk only for caching. Every protocol reaches the same filesystem. {{ className: 'lead' }}
+
+- **Filesystem behavior is tested continuously** with pjdfstest, xfstests, crash injection, and model-based simulation. See [Durability and consistency](/durability#continuous-integration-testing).
+- **Separate metadata and data paths** handle namespace operations independently from immutable file-data segments.
+- **No external database service**; data and metadata live in the object store.
+- **Encrypted before upload**: every block is compressed, then encrypted with XChaCha20-Poly1305, with no unencrypted mode.
 
 <div className="not-prose">
   <Button href="/encryption" variant="text" arrow="right">

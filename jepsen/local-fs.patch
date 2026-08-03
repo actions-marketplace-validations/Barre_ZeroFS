@@ -1,0 +1,284 @@
+diff --git a/src/jepsen/local_fs.clj b/src/jepsen/local_fs.clj
+index 4835127..f326319 100644
+--- a/src/jepsen/local_fs.clj
++++ b/src/jepsen/local_fs.clj
+@@ -15,7 +15,9 @@
+             [jepsen.local-fs [util :as util]]
+             [jepsen.local-fs.shell.workload :as shell]
+             [jepsen.local-fs.db [dir :as db.dir]
+-                                [lazyfs :as db.lazyfs]]
++                                [lazyfs :as db.lazyfs]
++                                [zerofs :as db.zerofs]
++                                [zerofs-ha :as db.zerofs-ha]]
+             [clojure.test.check :as tc]
+             [clojure.test.check [generators :as tc.gen]
+                                 [properties :as prop]
+@@ -26,8 +28,10 @@
+ 
+ (def dbs
+   "A map of DB names to functions that take CLI options and build DBs."
+-  {:dir    db.dir/db
+-   :lazyfs db.lazyfs/db})
++  {:dir       db.dir/db
++   :lazyfs    db.lazyfs/db
++   :zerofs    db.zerofs/db
++   :zerofs-ha db.zerofs-ha/db})
+ 
+ (defn stats-checker
+   "A stats checker that never fails"
+@@ -139,6 +143,8 @@
+ 
+    [nil "--lose-unfsynced-writes" "Generates special operations in the test which trigger the loss of un-fsynced writes. Probably only useful for lazyfs or other filesystems which support this type of fault injection."]
+ 
++   [nil "--failover" "Generates HA leader-failover operations (only useful with --db zerofs-ha). A failover loses no acknowledged write, so the model treats it as a global flush rather than a crash."]
++
+    [nil "--quickcheck-scour TRIAL-COUNT" "For nondeterministic tests, try running every single history this many times before declaring it passes. Helpful for shrinking when you have a lot of time to burn, and a bug that only manifests sometimes."
+     :default  1
+     :parse-fn parse-long
+@@ -150,7 +156,31 @@
+     :parse-fn parse-long
+     :validate [pos? "Must be positive"]]
+ 
+-   ["-v" "--version VERSION" "A version string, passed to the DB. For lazyfs, this controls the git commit we check out."]])
++   ["-v" "--version VERSION" "A version string, passed to the DB. For lazyfs, this controls the git commit we check out."]
++
++   [nil "--zerofs-bin PATH" "Path to the zerofs binary (for --db zerofs)."
++    :default "../zerofs/target/debug/zerofs"]
++
++   [nil "--zerofs-port PORT" "TCP port for the ZeroFS 9P server (for --db zerofs)."
++    :default 5564
++    :parse-fn parse-long
++    :validate [pos? "Must be positive"]]
++
++   [nil "--zerofs-password PASSWORD" "Encryption password for the ZeroFS store (for --db zerofs)."
++    :default "jepsen-test-password"]
++
++   [nil "--zerofs-writeback" "Mount ZeroFS with the FUSE writeback cache instead of write-through. Off by default so the client holds no un-fsynced page cache."
++    :default false]
++
++   [nil "--quickcheck-tests N" "How many random histories quickcheck should generate. Each runs a full DB setup/teardown, so lower this for faster CI runs."
++    :default 200
++    :parse-fn parse-long
++    :validate [pos? "Must be positive"]]
++
++   [nil "--history-scale N" "Multiplier for generated history length. 1000 suits deep conformance runs; lower it for crash runs, where each operation may trigger a server restart and long histories become intractable."
++    :default 1000
++    :parse-fn parse-long
++    :validate [pos? "Must be positive"]]])
+ 
+ (defn quickcheck-trials
+   "Runs trials of a history for quickcheck. Returns the first failing test run,
+@@ -196,16 +226,22 @@
+                          {:workload (:workload (:results test))
+                           :dir (.getCanonicalPath (store/path test))}))))
+             ; Great, now run quickcheck
+-            checked (tc/quick-check 200 prop)]
++            checked (tc/quick-check (:quickcheck-tests options) prop)]
+         ;(pprint checked)
+         (println)
+-        (let [dir (-> checked :shrunk :result-data :dir)
+-              [name time] (take-last 2 (str/split dir #"/"))
+-              url (str "http://localhost:8080/files/"
+-                       (URLEncoder/encode name) "/"
+-                       (URLEncoder/encode time))]
+-          (println "Shrunk test:" dir)
+-          (println (str "             " url)))))}})
++        ; On a pass there is no shrunk case, so only print the failing-case
++        ; pointer when one exists, and exit non-zero on failure so CI can gate.
++        (when (:shrunk checked)
++          (let [dir (-> checked :shrunk :result-data :dir)
++                [name time] (take-last 2 (str/split dir #"/"))
++                url (str "http://localhost:8080/files/"
++                         (URLEncoder/encode name) "/"
++                         (URLEncoder/encode time))]
++            (println "Shrunk test:" dir)
++            (println (str "             " url))))
++        (if (true? (:result checked))
++          (println "quickcheck passed")
++          (System/exit 1))))}})
+ 
+ (defn -main
+   "Handles command line arguments. Can run a test, or a web server for browsing
+diff --git a/src/jepsen/local_fs/db/core.clj b/src/jepsen/local_fs/db/core.clj
+index f57508f..e59c895 100644
+--- a/src/jepsen/local_fs/db/core.clj
++++ b/src/jepsen/local_fs/db/core.clj
+@@ -3,3 +3,7 @@
+ 
+ (defprotocol LoseUnfsyncedWrites
+   (lose-unfsynced-writes! [db] "Causes this filesystem to lose un-fsynced writes."))
++
++(defprotocol Failover
++  (failover! [db] "Fails the current leader over to the standby (HA clusters).
++  Acknowledged writes survive (semi-sync); only leadership moves."))
+diff --git a/src/jepsen/local_fs/shell/checker.clj b/src/jepsen/local_fs/shell/checker.clj
+index d708d90..1e813ba 100644
+--- a/src/jepsen/local_fs/shell/checker.clj
++++ b/src/jepsen/local_fs/shell/checker.clj
+@@ -265,6 +265,14 @@
+        (->> (map key)
+             (reduce fsync-path* fs)))))
+ 
++(defn fsync-everything
++  "ZeroFS's fsync is a global db.flush() barrier: it makes every pending write
++  durable (data and metadata alike), not just the fsync'd inode. Moves the whole
++  cache, every entry and every inode, to disk."
++  [fs]
++  (let [fs (reduce fsync-path* fs (keys (get-in fs [:cache :entries])))]
++    (reduce fsync-inode fs (keys (get-in fs [:cache :inodes])))))
++
+ (defn inodes-in-disk-entries
+   "Returns a collection (including duplicates) of every inode referenced on
+   disk in a filesystem."
+@@ -419,7 +427,10 @@
+     (persistent!
+       (reduce (fn [paths [path cache-entry]]
+                 (if (tombstone? cache-entry)
+-                  (dissoc! paths path)
++                  ; disk-paths is a set, so remove with disj! (dissoc! is for
++                  ; maps). This path is only reached once the cache can hold a
++                  ; tombstone, i.e. once metadata isn't written through.
++                  (disj! paths path)
+                   (conj! paths path)))
+               (transient disk-paths)
+               (-> fs :cache :entries (children path))))))
+@@ -634,11 +645,9 @@
+ 
+       :fsync
+       (let [entry (get-path fs value)]
+-        ;(prn :entry entry)
+-        [(cond (link? entry) (fsync-inode fs (:inode entry))
+-
+-               ; Right now directories are synced automatically.
+-               (dir? entry) fs
++        ; ZeroFS: any fsync is a global db.flush(), so flush the whole
++        ; filesystem regardless of which path's fd was fsynced.
++        [(cond (or (link? entry) (dir? entry)) (fsync-everything fs)
+ 
+                :else (throw+ {:type  ::can't-fsync
+                               :path  value
+@@ -669,6 +678,12 @@
+       [(lose-unfsynced-writes fs)
+        (assoc op :type :ok)]
+ 
++      ; HA failover loses no acked write (semi-sync replays + flushes the tail on
++      ; takeover), so model it as a global flush, not a crash.
++      :failover
++      [(fsync-everything fs)
++       (assoc op :type :ok)]
++
+       :mkdir
+       [(update-path* fs value
+                      (fn [path]
+@@ -816,12 +831,12 @@
+   Returns a pair of [fs', op']: the resulting state, and the completion
+   operation.
+ 
+-  Every operation fsyncs the root metadata--though not the data. This is how
+-  lazyfs works right now--it writes metadata directly through and doesn't cache
+-  it."
++  Unlike lazyfs, ZeroFS does NOT write metadata through on every op: data and
++  metadata alike sit in the memtable (the model's :cache) until a flush, so a
++  crash can lose un-fsynced metadata too. Nothing is moved to disk here; only an
++  explicit fsync (a global flush) or recovery does that."
+   [fs op]
+-  (let [[fs' op'] (fs-op* fs op)]
+-    [(fsync-path-recursively* fs') op']))
++  (fs-op* fs op))
+ 
+ (defn simple-trace
+   "Takes a collection of ops from a history and strips them down to just [type
+diff --git a/src/jepsen/local_fs/shell/client.clj b/src/jepsen/local_fs/shell/client.clj
+index c517def..999faee 100644
+--- a/src/jepsen/local_fs/shell/client.clj
++++ b/src/jepsen/local_fs/shell/client.clj
+@@ -15,7 +15,7 @@
+                                            hex->bytes
+                                            sh
+                                            *sh-trace*]]]
+-            [jepsen.local-fs.db.core :refer [lose-unfsynced-writes!]]
++            [jepsen.local-fs.db.core :refer [lose-unfsynced-writes! failover!]]
+             [knossos.op :as op]
+             [slingshot.slingshot :refer [try+ throw+]])
+   (:import (java.lang Process
+@@ -91,6 +91,10 @@
+     (do (lose-unfsynced-writes! db)
+         (assoc op :type :ok))
+ 
++    :failover
++    (do (failover! db)
++        (assoc op :type :ok))
++
+     :mkdir
+     (try+ (sh :mkdir (join-path value) {:dir dir})
+           (assoc op :type :ok)
+@@ -225,8 +229,13 @@
+     this)
+ 
+   (invoke! [this test op]
+-    (timeout 10000 (assoc op :type :info, :error :timeout)
+-             (fs-op! dir db op)))
++    ; Fault ops are slow (a failover waits out takeover_ttl + a ~20s restart),
++    ; so give them a generous timeout; a real hang still surfaces as :info-timeout.
++    (let [ms (case (:f op)
++               (:failover :lose-unfsynced-writes) 120000
++               10000)]
++      (timeout ms (assoc op :type :info, :error :timeout)
++               (fs-op! dir db op))))
+ 
+   (teardown! [this test])
+ 
+diff --git a/src/jepsen/local_fs/shell/workload.clj b/src/jepsen/local_fs/shell/workload.clj
+index 5a35407..f726915 100644
+--- a/src/jepsen/local_fs/shell/workload.clj
++++ b/src/jepsen/local_fs/shell/workload.clj
+@@ -66,30 +66,38 @@
+                                      (g/scale (partial * 0.01)))]
+                      {:f :truncate, :value [path size]})}
+    :lose-unfsynced-writes {:weight 1
+-                           :gen (g/return {:f :lose-unfsynced-writes})}})
++                           :gen (g/return {:f :lose-unfsynced-writes})}
++   :failover {:weight 1
++              :gen (g/return {:f :failover})}})
+ 
+ (defn fs-op-gen
+   "test.check generator for fs test ops. Generates append, write, mkdir, mv,
+   read, etc. Options are:
+ 
+     :dont                     A set of fs to skip
+-    :lose-unfsynced-writes    If set, emits operations to lose un-fsynced
+-                              writes"
+-  [{:keys [dont lose-unfsynced-writes]}]
+-  (let [fs (keys funs)
++    :lose-unfsynced-writes    If set, emits operations to lose un-fsynced writes
++    :failover                 If set, emits HA leader-failover operations"
++  [{:keys [dont lose-unfsynced-writes failover]}]
++  (let [; faults are not ordinary ops: only emit each when explicitly requested,
++        ; so plain conformance runs (and backends that don't implement a fault)
++        ; never see it.
++        faults #{:lose-unfsynced-writes :failover}
++        fs (remove faults (keys funs))
+         fs (remove dont fs)
+-        fs (if lose-unfsynced-writes
+-             (conj fs :lose-unfsynced-writes)
+-             fs)
++        fs (if lose-unfsynced-writes (conj fs :lose-unfsynced-writes) fs)
++        fs (if failover (conj fs :failover) fs)
+         gens (->> fs
+                   (map funs)
+                   (mapv (juxt :weight :gen)))]
+         (g/frequency gens)))
+ 
+ (defn fs-history-gen
+-  "Generates a whole history"
+-  [opts]
+-  (g/scale (partial * 1000)
++  "Generates a whole history. The size multiplier sets how long histories get;
++  upstream's 1000 is good for deep conformance runs, but it makes crash runs
++  intractable (every few ops triggers a server kill and recovery), so it's
++  tunable via --history-scale."
++  [{:keys [history-scale] :as opts}]
++  (g/scale (partial * (or history-scale 1000))
+     (g/vector (fs-op-gen opts))))
+ 
+ (defn workload

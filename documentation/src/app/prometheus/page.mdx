@@ -1,0 +1,172 @@
+export const metadata = {
+  title: 'Prometheus Metrics',
+  description:
+    'Configure the ZeroFS Prometheus endpoint and interpret its metric series.',
+}
+
+# Prometheus Metrics
+
+ZeroFS can expose metrics in Prometheus format over an HTTP endpoint. {{ className: 'lead' }}
+
+## Configuration
+
+Add a `[prometheus]` section to your configuration file:
+
+```toml
+[prometheus]
+addresses = ["127.0.0.1:9091"]
+```
+
+This starts an HTTP server on the specified address. Metrics are available at `/metrics`:
+
+```bash
+curl http://127.0.0.1:9091/metrics
+```
+
+Multiple bind addresses are supported, following the same pattern as other ZeroFS servers:
+
+```toml
+[prometheus]
+addresses = ["127.0.0.1:9091", "[::1]:9091"]  # Dual-stack localhost
+```
+
+Each entry binds one listener, so the addresses must not overlap. `0.0.0.0:9091` already accepts loopback connections; adding `127.0.0.1:9091` alongside it conflicts on the same port, and the losing bind is logged and dropped.
+
+`addresses` defaults to `127.0.0.1:9091`. An empty `[prometheus]` section is valid and starts the endpoint on that address. When the `[prometheus]` section is absent, no metrics endpoint is started.
+
+## Available Metrics
+
+### Filesystem Operations
+
+Counters that track cumulative operations since server start:
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `zerofs_files_created_total` | counter | Files created |
+| `zerofs_files_deleted_total` | counter | Files deleted |
+| `zerofs_files_renamed_total` | counter | Files renamed |
+| `zerofs_directories_created_total` | counter | Directories created |
+| `zerofs_directories_deleted_total` | counter | Directories deleted |
+| `zerofs_directories_renamed_total` | counter | Directories renamed |
+| `zerofs_links_created_total` | counter | Links created |
+| `zerofs_links_deleted_total` | counter | Links deleted |
+| `zerofs_links_renamed_total` | counter | Links renamed |
+
+### I/O
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `zerofs_read_operations_total` | counter | Total read operations |
+| `zerofs_write_operations_total` | counter | Total write operations |
+| `zerofs_bytes_read_total` | counter | Total bytes read |
+| `zerofs_bytes_written_total` | counter | Total bytes written |
+| `zerofs_total_operations` | counter | Total operations across all types |
+
+### Garbage Collection
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `zerofs_tombstones_created_total` | counter | Tombstones created for deleted data |
+| `zerofs_tombstones_processed_total` | counter | Tombstones processed by GC |
+| `zerofs_gc_extents_deleted_total` | counter | Extents reclaimed by GC |
+| `zerofs_gc_runs_total` | counter | Number of GC cycles started |
+
+An extent is the 32 KiB unit of file data, stored as a frame in an immutable segment object. Earlier releases called this unit a chunk and named the metric `zerofs_gc_chunks_deleted_total`. The old series stops appearing after an upgrade; update dashboards and alert rules that reference it.
+
+The metrics above cover the tombstone sweep that reclaims a deleted file's extents. Segment reclamation and compaction, which recover dead space inside the immutable segment objects that hold file data, are reported separately below.
+
+### Segment Footprint
+
+Gauges reporting the on-store segment footprint as of the last reclaim scan. These are the store-wide totals from which dead space is derived; between passes they hold their last value.
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `zerofs_segment_count` | gauge | Segment objects scanned |
+| `zerofs_segment_appended_bytes` | gauge | Bytes appended across all segments (excludes segment framing, so it slightly exceeds on-store bytes) |
+| `zerofs_segment_live_bytes` | gauge | Referenced (live) bytes across all segments |
+| `zerofs_segment_reclaimable_bytes` | gauge | Dead bytes recoverable by deletion or compaction (appended minus live) |
+| `zerofs_segment_dead_ratio` | gauge | Reclaimable over appended, from 0 to 1 |
+
+### Segment Reclamation and Compaction
+
+Counters accumulate across reclaim passes since server start; the gauges hold the last pass's backlog. A reclaim pass deletes fully-dead segments, compacts fragmented and small ones, repacks read-hot seams and the write-cold tail, and reclaims counter-less orphan objects.
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `zerofs_segment_gc_passes_total` | counter | Reclaim passes run |
+| `zerofs_segment_gc_segments_deleted_total` | counter | Fully-dead segment objects deleted |
+| `zerofs_segment_gc_deleted_bytes_total` | counter | Bytes freed by deleting dead segments |
+| `zerofs_segment_gc_segments_compacted_total` | counter | Live segments consumed (repacked) by compaction |
+| `zerofs_segment_gc_segments_packed_total` | counter | Segment objects written as compaction output |
+| `zerofs_segment_gc_frames_relocated_total` | counter | Extent frames rewritten during compaction |
+| `zerofs_segment_gc_compaction_freed_bytes_total` | counter | Dead bytes reclaimed by compaction |
+| `zerofs_segment_gc_batches_total` | counter | Compaction batches run |
+| `zerofs_segment_gc_tail_scrubbed_total` | counter | Write-cold tail segments repacked by the scrub |
+| `zerofs_segment_gc_chains_packed_total` | counter | Read-hot seam chains fully repacked |
+| `zerofs_segment_gc_nominations_total` | counter | Read-directed compaction nominations drained |
+| `zerofs_segment_gc_nominations_dropped_total` | counter | Nominations dropped (segment gone or no longer fragmented) |
+| `zerofs_segment_gc_hot_seams_total` | counter | Hot cross-segment read seams observed |
+| `zerofs_segment_gc_orphans_reclaimed_total` | counter | Counter-less orphan objects reclaimed by the slow sweep |
+| `zerofs_segment_gc_awaiting_delete` | gauge | Dead segments waiting out their delete horizon |
+| `zerofs_segment_gc_awaiting_delete_bytes` | gauge | Bytes held by segments awaiting deletion |
+| `zerofs_segment_gc_candidate_backlog` | gauge | Fragmented or small segments awaiting compaction |
+| `zerofs_segment_gc_chains_deferred` | gauge | Read-hot seam chains deferred to a later pass |
+| `zerofs_segment_gc_saturated` | gauge | 1 when the last pass left actionable backlog (an accelerated cadence tier may engage), else 0 |
+
+Read-directed compaction (nominations, hot seams, chains, tail scrub) only runs on the read-write leader. Read replicas and checkpoint mounts run no reclaim, so these series stay flat there.
+
+### Filesystem State
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `zerofs_used_bytes` | gauge | Total bytes stored in the filesystem |
+| `zerofs_used_inodes` | gauge | Total active inodes (files, directories, symlinks, and special files) |
+| `zerofs_dedup_retained_results` | gauge | Completed mutation results retained for retry replay |
+| `zerofs_dedup_inflight_ids` | gauge | Mutation IDs currently being applied |
+| `zerofs_dedup_replay_pinned_results` | gauge | Retained results currently pinned while a retry response is reconstructed |
+
+### Memory (jemalloc)
+
+Gauges that report the state of the jemalloc allocator:
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `zerofs_jemalloc_allocated_bytes` | gauge | Bytes actively allocated by the application |
+| `zerofs_jemalloc_resident_bytes` | gauge | Bytes in physically resident pages mapped by the allocator |
+| `zerofs_jemalloc_mapped_bytes` | gauge | Bytes in active pages mapped by the allocator |
+| `zerofs_jemalloc_retained_bytes` | gauge | Bytes in virtual memory mappings retained for future reuse |
+| `zerofs_jemalloc_metadata_bytes` | gauge | Bytes dedicated to allocator metadata |
+
+`zerofs_jemalloc_resident_bytes` tracks the allocator's physical memory footprint. `zerofs_jemalloc_retained_bytes` counts virtual address space kept for reuse and does not consume physical memory, so memory alerts should key on resident, not retained or mapped.
+
+### Metadata LSM
+
+ZeroFS exposes internal metrics from its metadata LSM tree, which holds inode and directory metadata plus per-extent pointers; file content lives in segment objects outside the LSM. These metrics are prefixed with `lsm_` and include compaction and storage statistics. The exact metrics depend on the engine version and are discovered at runtime.
+
+Common metadata metrics include:
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `lsm_compactor_bytes_compacted` | counter | Total bytes processed by compaction |
+| `lsm_compactor_running_compactions` | gauge | Number of active compaction tasks |
+| `lsm_compactor_total_bytes_being_compacted` | gauge | Bytes currently being compacted |
+
+Compaction metrics cover metadata compaction only. Segment objects holding file data are not part of the LSM and are never rewritten by it.
+
+<Note>
+The `lsm_`-prefixed metrics are only available in read-write mode; read-only instances do not expose them.
+</Note>
+
+## Prometheus Scrape Configuration
+
+Add ZeroFS as a target in your `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: 'zerofs'
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['localhost:9091']
+```
+
+A background task collects all metric values every 5 seconds, and the endpoint serves the last collected values. A `scrape_interval` below 5 seconds does not increase resolution.

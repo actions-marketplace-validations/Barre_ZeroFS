@@ -1,26 +1,20 @@
 export const metadata = {
-  title: 'Configuration Guide',
+  title: 'Configuration',
   description:
-    'Complete guide to configuring ZeroFS using TOML configuration files, including storage backends and network settings.',
+    'Reference for ZeroFS storage, cache, network, filesystem, and runtime settings.',
 }
 
-# Configuration Guide
+# Configuration
 
-ZeroFS uses TOML configuration files for all settings. This guide covers all available configuration options to help you configure ZeroFS for your specific use case. {{ className: 'lead' }}
+ZeroFS reads storage, cache, server, and runtime settings from a TOML file passed to `zerofs run`. {{ className: 'lead' }}
 
-## Getting Started
+## Create a Configuration
 
-Create a configuration file using the `init` command:
+Generate the default template, then edit it for the storage backend and listeners you intend to use:
 
 ```bash
 zerofs init
 ```
-
-This creates a template configuration file that you can customize.
-
-## Configuration File Structure
-
-### Basic Configuration
 
 ```toml
 # Cache configuration (required)
@@ -33,9 +27,55 @@ memory_size_gb = 2.0             # Memory cache size in GB (optional)
 [storage]
 url = "s3://bucket/path"         # Storage backend URL
 encryption_password = "your-secure-password"  # Encryption password
+
+# Server configuration (required table, every subsection optional)
+[servers.nfs]
+addresses = ["127.0.0.1:2049"]
 ```
 
+Three tables are required: `[cache]`, `[storage]`, and `[servers]`. A file missing any of them fails to parse; omitting `[servers]` reports `missing field servers`. Each `[servers.*]` subsection is optional. An empty `[servers]` table parses, but `zerofs run` then exits with `No servers configured. At least one server (NFS, 9P, NBD, or RPC) must be enabled.` At least one subsection must start a listener: for 9P, NBD, and RPC a `unix_socket` alone counts, and a `[servers.webui]` section counts in Web-UI-enabled builds.
+
+Two parsing rules apply to the whole file:
+
+- **Unknown keys are rejected.** A misspelled key aborts startup with a parse error naming the key. The exception is the free-form backend tables `[aws]`, `[azure]`, and `[gcp]`; see [Backend Option Tables](#backend-option-tables).
+- **Sizes are decimal gigabytes.** All `*_gb` keys (`cache.disk_size_gb`, `cache.memory_size_gb`, `filesystem.max_size_gb`) are interpreted as 10⁹ bytes, not GiB. Fractional values are accepted: `0.5` is 500 MB.
+
+## Cache
+
+The `[cache]` table is required. ZeroFS runs two caches, each with a memory and a disk tier: a decoded-block cache for metadata and a raw-parts cache for object bytes. Both disk tiers live under `dir`, inside a per-bucket subdirectory: `bucket_<8hex>/hybrid_cache/` and `bucket_<8hex>/parts_cache/`; see [Caching](/caching) for the layout. File data in the parts cache is stored as fetched from the object store: compressed and encrypted.
+
+| Key | Required | Default | Description |
+| --- | --- | --- | --- |
+| `dir` | yes | — | Directory holding both disk tiers. Supports [environment variable substitution](#environment-variable-substitution). |
+| `disk_size_gb` | yes | — | Total disk budget for both disk tiers, in decimal GB. |
+| `memory_size_gb` | no | `0.25` | Total memory budget for both memory tiers, in decimal GB. |
+| `warm_metadata` | no | `"filters_index"` | Startup warm-up: `"off"`, `"filters_index"` (metadata SST bloom filters and indexes), or `"full"` (also metadata data blocks). File data is never warmed. |
+
+See [Caching](/caching) for how the two budgets are split between the tiers.
+
 ## Storage Backends
+
+### URL Schemes
+
+The `url` field under `[storage]` accepts the following schemes.
+
+| Scheme | Backend | Example |
+| --- | --- | --- |
+| `s3://`, `s3a://` | Amazon S3 and S3-compatible | `s3://bucket/path` |
+| `gs://` | Google Cloud Storage | `gs://bucket/path` |
+| `azure://` | Azure Blob Storage | `azure://container/path` |
+| `abfs://`, `abfss://` | Azure Blob Storage | `abfss://container@account.dfs.core.windows.net/path` |
+| `memory://` | In-memory store, testing only | `memory:///` |
+
+`az://` and `adl://` also parse as Azure aliases. `adl://container/path` and the bare `abfs://container/path` form behave like `azure://container/path`. In the `az://` form, the host is used as the container name and the first path segment is excluded from the object path; use `azure://` instead.
+
+Full `https://` URLs are routed by host suffix. Hosts ending in `amazonaws.com` or `r2.cloudflarestorage.com` are treated as S3 (`https://bucket.s3.region.amazonaws.com`, `https://ACCOUNT_ID.r2.cloudflarestorage.com/bucket`). Hosts ending in `dfs.core.windows.net`, `blob.core.windows.net`, `dfs.fabric.microsoft.com`, or `blob.fabric.microsoft.com` are treated as Azure (`https://account.blob.core.windows.net/container/path`). Any other `http://` or `https://` URL is rejected at startup with `feature for Http not enabled`; generic HTTP and WebDAV endpoints are not supported. For S3-compatible services on other hosts, such as MinIO, use `url = "s3://bucket/path"` with `endpoint` under `[aws]`, plus `allow_http = "true"` for plain-HTTP endpoints.
+
+A scheme selects the backend only. Credentials come from the `[aws]`, `[azure]`, or `[gcp]` table regardless of which alias is used.
+
+<Note>
+`memory:///` keeps all data in process memory: the store starts empty and everything is lost when the process exits. Use it for throwaway testing only.
+</Note>
 
 ### AWS S3
 
@@ -43,13 +83,14 @@ encryption_password = "your-secure-password"  # Encryption password
 [storage]
 url = "s3://my-bucket/zerofs-data"
 encryption_password = "secure-password-here"
+# storage_class = "..."          # Optional, provider-specific; see Storage Class below
 
 [aws]
 access_key_id = "AKIAIOSFODNN7EXAMPLE"
 secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 region = "us-east-1"              # Optional, defaults to us-east-1
 endpoint = "https://s3.amazonaws.com"  # Optional for S3-compatible services
-allow_http = "false"                # Set to true for non-HTTPS endpoints
+allow_http = "false"                # Set to "true" (quoted) for plain-HTTP endpoints
 conditional_put = "redis://localhost:6379"  # For stores without conditional put support
 ```
 
@@ -107,46 +148,122 @@ service_account = "/path/to/service-account-key.json"
 ```
 
 <Note>
-GCS authentication follows Google's Application Default Credentials (ADC) chain:
-1. If running on a GCP VM or GKE pod with an attached service account, credentials are automatically discovered via the metadata service
-2. Otherwise, uses `GOOGLE_APPLICATION_CREDENTIALS` environment variable or `[gcp]` config section
-3. Falls back to gcloud CLI credentials if available
+GCS credentials resolve in this order:
+1. Explicit service-account credentials from the `[gcp]` section (`service_account` path or `service_account_key`)
+2. An Application Default Credentials file: the `application_credentials` key, the `GOOGLE_APPLICATION_CREDENTIALS` environment variable, or the gcloud CLI's `~/.config/gcloud/application_default_credentials.json`
+3. The VM/GKE metadata service, as the last fallback; this is why no `[gcp]` section is needed on GCP with an attached service account
 </Note>
 
-### Local Filesystem
+### Backend Option Tables {{ id: 'backend-option-tables' }}
+
+`[aws]`, `[azure]`, and `[gcp]` are free-form key-value tables, not fixed schemas. At startup, each key is lowercased, prefixed with `aws_`, `azure_`, or `google_`, and forwarded to the object-store builder. For example, `[aws]` accepts `session_token`, `virtual_hosted_style_request`, and `skip_signature`; Azure's `storage_sas_token` is forwarded as `azure_storage_sas_token`.
+
+The object-store documentation lists the accepted keys: [`AmazonS3ConfigKey`](https://docs.rs/object_store/latest/object_store/aws/enum.AmazonS3ConfigKey.html), [`AzureConfigKey`](https://docs.rs/object_store/latest/object_store/azure/enum.AzureConfigKey.html), and [`GoogleConfigKey`](https://docs.rs/object_store/latest/object_store/gcp/enum.GoogleConfigKey.html).
+
+Two rules apply:
+
+- **Every value must be a TOML string.** `allow_http = "true"`, not `allow_http = true`. A non-string value fails at startup with `Failed to parse config file`.
+- **Unknown keys are dropped without warning.** A misspelled key such as `secret_acess_key` produces no configuration error and surfaces later as an authentication or connection failure. Check key spelling before debugging credentials.
+
+Values in all of these tables support [environment variable substitution](#environment-variable-substitution).
+
+### Storage Class
+
+The optional `storage_class` field under `[storage]` sets the object storage class/tier for every write. The value is sent verbatim as the backend's own tiering header on every PUT and multipart upload: `x-amz-storage-class` (S3), `x-goog-storage-class` (GCS), `x-ms-access-tier` (Azure).
 
 ```toml
 [storage]
-url = "file:///path/to/storage"
+url = "s3://my-bucket/zerofs-data"
 encryption_password = "secure-password-here"
-
-# No additional backend configuration needed
+storage_class = "..."  # provider-specific value, e.g. a single-zone hot class
 ```
 
+Because the value is verbatim, it must be valid for your backend; a value the backend does not recognize (an S3 class name on Azure, for example) is rejected by the store on the first write. Omit the field to use the account or container default.
+
+Server-side copies cannot carry a storage class: objects written via copy land in the bucket or account default class regardless of this setting.
+
+<Warning>
+ZeroFS reads segment objects, SSTs, and the manifest continuously, so `storage_class` must be a hot, instant-access tier:
+
+- **Archive** tiers (S3 `GLACIER`/`DEEP_ARCHIVE`, Azure `Archive`) require a restore before objects can be read. ZeroFS cannot read segment objects, SSTs, or the manifest behind a restore step, so the volume becomes unusable. Never set an archive class.
+- **Infrequent-access** tiers work but charge a per-GB retrieval fee on every read, so for ZeroFS's constant reads they usually cost **more**, not less.
+</Warning>
+
+
 ## Network Services
+
+The `[servers]` table is required; each subsection below is optional. A server runs only when its section is present. An empty `[servers]` table is not runnable: `zerofs run` exits with `No servers configured. At least one server (NFS, 9P, NBD, or RPC) must be enabled.`
+
+`addresses` is a list of socket addresses. Each entry binds one listener, so multiple entries serve the same filesystem on multiple addresses. IPv6 addresses use brackets:
+
+```toml
+[servers.nfs]
+addresses = ["0.0.0.0:2049"]                    # All IPv4 interfaces
+# addresses = ["[::]:2049"]                     # All IPv6 interfaces
+# addresses = ["127.0.0.1:2049", "[::1]:2049"]  # Dual-stack localhost
+```
+
+Omitting `addresses` starts no TCP listener; there is no implicit `127.0.0.1` bind. The `127.0.0.1` addresses for NFS (2049), 9P (5564), NBD (10809), and RPC (7000) appear in the template generated by `zerofs init`, not as built-in defaults. The 9P, NBD, and RPC servers can serve over `unix_socket` alone.
 
 ### NFS Server
 
 ```toml
 [servers.nfs]
-addresses = ["0.0.0.0:2049"]  # Bind addresses (default: ["127.0.0.1:2049"])
+addresses = ["0.0.0.0:2049"]
 ```
+
+NFS is TCP-only: `[servers.nfs]` accepts only `addresses` and has no `unix_socket` key.
 
 ### 9P Server
 
 ```toml
 [servers.ninep]
-addresses = ["0.0.0.0:5564"]  # Bind addresses (default: ["127.0.0.1:5564"])
-unix_socket = "/tmp/zerofs.sock"
+addresses = ["0.0.0.0:5564"]
+unix_socket = "/tmp/zerofs.9p.sock"  # Optional
 ```
 
 ### NBD Server
 
 ```toml
 [servers.nbd]
-addresses = ["0.0.0.0:10809"]  # Bind addresses (default: ["127.0.0.1:10809"])
-unix_socket = "/tmp/zerofs-nbd.sock"
+addresses = ["0.0.0.0:10809"]
+unix_socket = "/tmp/zerofs.nbd.sock"  # Optional
 ```
+
+### RPC Server
+
+```toml
+[servers.rpc]
+addresses = ["127.0.0.1:7000"]
+unix_socket = "/tmp/zerofs.rpc.sock"
+```
+
+The admin endpoint for `zerofs checkpoint`, `zerofs flush`, `zerofs monitor`, `zerofs fatrace`, and `zerofs otrace`. These commands read the same configuration file, try the Unix socket first if the socket file exists, then each configured address in turn (the order is not defined). Without a `[servers.rpc]` section, they exit with `RPC server not configured in config file`. See [Monitoring](/monitoring) and [Checkpoints](/checkpoints).
+
+### Web UI
+
+```toml
+[servers.webui]
+addresses = ["127.0.0.1:8080"]  # Default when the section is present
+uid = 1000                      # Required
+gid = 1000                      # Required
+```
+
+`uid` and `gid` set the POSIX identity for all file operations performed from the browser. See [Web UI](/web-ui).
+
+## Metrics and Telemetry
+
+The `[prometheus]` and `[telemetry]` tables sit at the top level, not under `[servers]`:
+
+```toml
+[prometheus]
+addresses = ["127.0.0.1:9091"]  # Default when the section is present
+
+[telemetry]
+enabled = true  # Default, also when the section is absent
+```
+
+Without a `[prometheus]` section, no metrics endpoint is started. Telemetry defaults to enabled whether or not the section is present. See [Prometheus Metrics](/prometheus) and [Telemetry](/telemetry).
 
 ## Filesystem Quotas
 
@@ -157,210 +274,134 @@ ZeroFS supports configurable filesystem size limits:
 max_size_gb = 100.0  # Limit filesystem to 100 GB
 ```
 
-When the quota is reached, write operations return `ENOSPC` (No space left on device). Delete and truncate operations continue to work, allowing you to free space. If not specified, the filesystem defaults to 16 EiB (effectively unlimited).
+When the quota is reached, write operations return `ENOSPC` (No space left on device). Delete and truncate operations continue to work, allowing you to free space. If not specified, the limit defaults to 16 EiB, the maximum filesystem size.
 
 ## Compression
 
-ZeroFS compresses file data (chunks) before encryption. You can choose between two compression algorithms:
+ZeroFS compresses each 32 KiB extent of file data before encrypting it; the resulting frames are packed into segment objects on the object store. The default is tuned for object storage, where network and storage cost dominate local CPU:
 
 ```toml
 [filesystem]
-compression = "lz4"      # Fast compression (default)
+compression = "zstd-3"   # Zstd at level 3 (default)
 # or
-compression = "zstd-3"   # Zstd with level 3
+compression = "lz4"      # Fast compression, lower ratio
 ```
 
 ### Algorithms
 
-- **`lz4`** (default): Very fast compression and decompression with moderate compression ratio. Best for workloads where speed is critical.
+- **`zstd-{level}`** (default: `zstd-3`): Zstandard compression with configurable level from 1 to 22. Lower levels (1-5) are faster, higher levels (15-22) achieve better compression but are slower.
 
-- **`zstd-{level}`**: Zstandard compression with configurable level from 1 to 22. Lower levels (1-5) are faster, higher levels (15-22) achieve better compression but are slower.
+- **`lz4`**: Very fast compression and decompression with moderate compression ratio. Prefer for write-throughput-bound workloads where compression CPU is the bottleneck.
 
-### Changing Compression On-the-fly
+### Changing Compression
 
 You can change the compression algorithm at any time without migration:
 
 - **New writes** use the currently configured algorithm
 - **Existing data** remains readable regardless of how it was compressed
-- Compression format is auto-detected per-chunk when reading
+- Compression format is auto-detected per-frame when reading
+- **Existing data is never re-encoded**: compaction relocates frames byte-for-byte without recompressing, so changing the algorithm or level does not rewrite or shrink data already stored; old and new encodings coexist indefinitely until the data is overwritten or removed
 
 
 ## LSM Tree Performance Tuning
 
-ZeroFS uses an LSM (Log-Structured Merge) tree as its underlying storage engine. For advanced performance tuning, you can configure LSM parameters:
+ZeroFS keeps metadata (inodes, directory entries, and the per-extent frame pointers) in an LSM (Log-Structured Merge) tree database that sits in the object store. File contents live in immutable segment objects written directly to the object store; this data path has no user-facing tuning keys, though the `[gc]` section described below tunes the loop that reclaims segment space. The `[lsm]` section tunes the metadata store, though `flush_interval_secs` and `sync_writes` also govern when buffered file data is sealed and uploaded. See [Architecture](/architecture).
 
 ```toml
 [lsm]
-l0_max_ssts = 16                 # Max SST files in L0 before compaction
-max_unflushed_gb = 1.0           # Max unflushed data before forcing flush (in GB)
-max_concurrent_compactions = 8   # Max concurrent compaction operations
+l0_max_ssts = 256                # Max SST files in L0 before compaction
+max_concurrent_compactions = 2   # Max concurrent compaction operations
 flush_interval_secs = 30         # Interval between periodic flushes (in seconds)
+sync_writes = false              # Make every write durable on return
 ```
 
 ### Parameters
 
-- **`l0_max_ssts`** (default: 16, min: 4): Maximum number of SST (Sorted String Table) files allowed in level 0 before triggering compaction. Lower values reduce read amplification but increase write amplification. Higher values do the opposite.
+- **`l0_max_ssts`** (default: 256, min: 4): Maximum number of SST (Sorted String Table) files allowed in level 0 before triggering compaction. The same value applies per key. Lower values reduce read amplification but increase write amplification. Higher values do the opposite.
 
-- **`max_unflushed_gb`** (default: 1.0, min: 0.1): Maximum amount of unflushed data (in gigabytes) before forcing a flush to storage. Supports fractional values like `0.5` for 500 MB. Larger values improve write batching but increase memory usage.
+- **`max_concurrent_compactions`** (default: 2, min: 1): Maximum number of metadata compaction operations that can run concurrently. The store holds only metadata (file contents are immutable segment objects), so compactions are small and seldom pile up; a low cap keeps object-store request and CPU use down. Compaction always runs embedded in `zerofs run`; there is no separate compactor process.
 
-- **`max_concurrent_compactions`** (default: 8, min: 1): Maximum number of compaction operations that can run concurrently. Higher values can improve throughput on systems with many CPU cores and high network throughput but increase memory usage.
+- **`flush_interval_secs`** (default: 30, min: 5): Interval in seconds between periodic background flushes to durable storage. Each flush first seals the open segment buffer, uploading buffered file data, then flushes the metadata store. Between flushes, up to 256 MiB of committed writes can sit in the in-memory open segment. `fsync` calls from clients (9P fsync, NFS COMMIT, NBD flush) always trigger an immediate flush regardless of this interval, unless `[filesystem] ignore_fsync = true`, which makes `fsync` a no-op; see [High Availability](#high-availability).
 
-- **`flush_interval_secs`** (default: 30, min: 5): Interval in seconds between periodic background flushes to durable storage. Lower values flush more frequently. Higher values improve write throughput by batching more data before flushing. Note that `fsync` calls on NBD and 9P always trigger an immediate flush regardless of this interval.
-
-- **`wal_enabled`** (default: `true`): Controls the write-ahead log (WAL). Can be changed at any time without data loss. Without WAL, each `fsync` flushes the memtable and produces a small SST, leading to compaction churn. With WAL, fsyncs write to the WAL instead, so the memtable keeps growing and flushes produce properly-sized SSTs. Disable WAL for bulk data loading where fsyncs are rare — the extra write per mutation becomes unnecessary overhead.
+- **`sync_writes`** (default: `false`): When enabled, every write is durably flushed before returning success, eliminating the "in-memory unflushed" window between fsync calls. This does **not** change POSIX fsync semantics: with the default `false`, explicit `fsync` from clients is still honored and waits for durable persistence. The flag only governs writes *between* fsync calls. Expensive: each coalesced batch forces a segment seal plus a memtable flush (concurrent writes still merge into a single batch and a single flush). Rejected in combination with `[filesystem] ignore_fsync`. See the [Eliminating the Durability Window](/durability#eliminating-the-durability-window) section for guidance on when to enable.
 
 <Note>
-These are advanced settings. The defaults are optimized for most workloads. Only modify these if you understand LSM tree behavior and are experiencing specific performance issues.
+These are advanced settings. The defaults suit most workloads. Change them only in response to a specific, observed performance problem.
 </Note>
 
 ### When to Tune LSM Parameters
 
 Consider tuning these parameters if you're experiencing:
 
-- **High write latency**: Increase `max_unflushed_gb` to batch more writes
 - **High read latency**: Decrease `l0_max_ssts` to reduce read amplification
 - **CPU / Network underutilization**: Increase `max_concurrent_compactions` on high-core systems
-- **Memory pressure**: Decrease `max_unflushed_gb` to reduce memory usage
+- **Too-frequent background flushes**: Increase `flush_interval_secs`; the crash-loss window for un-`fsync`'d writes grows accordingly
 
-## Separate WAL Object Store
+## Segment Garbage Collection
 
-By default the WAL is written to the same object store as everything else. You can point it at a separate, lower-latency store to reduce fsync latency. See [Separate WAL Store](/separate-wal) for details.
+The `[gc]` section tunes the segment reclamation loop described under [Garbage Collection](/garbage-collection) and not the tombstone sweep, the orphan sweep, or the metadata compaction above.
 
 ```toml
-[wal]
-url = "file:///mnt/nvme/zerofs-wal"
+[gc]
+interval_secs = 60               # Pass interval while the store is active
+idle_interval_secs = 5           # Pass interval while draining backlog on an idle store
+busy_backlog_interval_secs = 15  # Pass interval while active with a large dead backlog
+busy_backlog_dead_percent = 20   # Dead-space % at/above which the busy-backlog interval applies
+min_batches_per_pass = 4         # Compaction batches a busy pass runs before yielding to load
+compact_round_max_mib = 256      # Per-round compaction budget (selection cap, reserve, gather RAM)
+read_directed = true             # Reads steer compaction (nominations, seams, chains)
+tail_scrub_min_dead_percent = 5  # Repack write-cold segments above this % dead (0 = off)
 ```
 
-The `[wal]` section supports its own `[wal.aws]`, `[wal.azure]`, and `[wal.gcp]` credential blocks, independent from the main storage credentials.
+### Parameters
 
-<Note>
-Whether you use a separate WAL store is decided at filesystem creation time and cannot be changed later.
-</Note>
+- **`interval_secs`** (default: 60, min: 5): Base delay between segment GC passes and the maximum delay used by the adaptive cadence. It affects reclamation speed, not deletion safety. Setting it below the normal flush cadence can create more small sealed segments.
+
+- **`idle_interval_secs`** (default: 5, min: 1, capped at `interval_secs`): Delay used when the previous pass exhausted its budget, actionable work remains, and the store has stayed idle. A pass can run up to 32 batches while it remains idle. Setting this equal to `interval_secs` disables the idle acceleration tier.
+
+- **`busy_backlog_interval_secs`** (default: 15, min: 5, capped at `interval_secs`): Delay used while the store is active and either dead space reaches `busy_backlog_dead_percent` or reserve-deferred hot seams remain. Setting it equal to `interval_secs` disables this middle cadence tier.
+
+- **`busy_backlog_dead_percent`** (default: 20): Dead-space percentage that activates the busy-backlog cadence. It is a ratio, so absolute garbage volume alone does not activate the tier.
+
+- **`min_batches_per_pass`** (default: 4, min: 1): Batches completed before a pass starts yielding to foreground activity. Batches are sequential, so raising the floor increases work per pass without multiplying peak gather memory.
+
+- **`compact_round_max_mib`** (default: 256, range: 64–4096): Per-round live-data budget and approximate gather-memory limit. Raising it increases reclamation work per batch and allows larger [read-directed](/read-directed-compaction) chains to be packed, at the cost of more memory.
+
+- **`read_directed`** (default: `true`): Whether reads steer compaction: the nomination priority, seam statistics, and chain repacks described under [Read-Directed Compaction](/read-directed-compaction). Turning it off stops all read-side recording; counter-driven reclamation and the tail scrub are unaffected.
+
+- **`tail_scrub_min_dead_percent`** (default: 5, range: 1–50; 0 disables it): Minimum dead percentage for repacking a write-cold segment with leftover pass budget. Lower values recover more space but rewrite more live data per byte reclaimed. Raise it on request-billed or rewrite-sensitive backends.
 
 ## Multiple Instances
 
-ZeroFS supports running multiple instances on the same storage backend: one read-write instance and multiple read-only instances.
+One read-write instance and any number of read-only instances can run on the same storage backend, all using the same configuration file. See [Read Replicas](/read-replicas) for startup, freshness, and restrictions.
 
-```bash
-# Read-write instance (default)
-zerofs run -c zerofs.toml
+## High Availability
 
-# Read-only instances
-zerofs run -c zerofs.toml --read-only
-```
-
-Read-only instances automatically see updates from the writer and return `EROFS` errors for write operations.
-
-<Note>
-Only one read-write instance can run at a time. Multiple read-only instances can run safely alongside the writer for load balancing.
-</Note>
-
-## Complete Examples
-
-### Basic S3 Configuration
+A `[replication]` section runs the node as one half of a leader/standby pair over a single object store, with automatic failover that loses no `fsync`'d data. Each node has its own config file. See [High Availability](/high-availability) for the design, guarantees, and a full two-node example.
 
 ```toml
-# /etc/zerofs/zerofs.toml
-[cache]
-dir = "/var/cache/zerofs"
-disk_size_gb = 10.0
-
-[storage]
-url = "s3://my-bucket/zerofs-data"
-encryption_password = "your-secure-password"
-
-[aws]
-access_key_id = "AKIAIOSFODNN7EXAMPLE"
-secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-# conditional_put = "redis://localhost:6379"  # Only needed for S3-compatible stores without conditional put support
-
-[servers.nfs]
-addresses = ["0.0.0.0:2049"]
+[replication]
+node_id = "node-a"
+role = "leader"                       # initial role: "leader" or "standby"
+replication_listen = "10.0.0.1:9000"  # this node receives ships and heartbeats here
+peers = ["10.0.0.2:9000"]             # the other node's replication_listen
 ```
 
-### Basic GCS Configuration
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `node_id` | yes | Stable identity of this node within the pair. |
+| `role` | yes | `"leader"` or `"standby"`. The running role is decided at startup by asking the peer; this is the bootstrap hint. |
+| `replication_listen` | automatic HA | `host:port` this node receives the leader's ships and heartbeats on. |
+| `peers` | automatic HA | The other node's `replication_listen`. |
+| `force_recovery` | no | Break-glass, one-startup replacement of the durable leader marker. Requires `role = "leader"` and `peers = []`; never leave it enabled. |
 
-**On GCP VM/GKE (recommended):**
+Set both `replication_listen` and `peers` on every node so either can lead after a role swap. ZeroFS rejects a configuration that sets only one. A standalone node may omit both; the forced-recovery procedure can temporarily remove `peers` as described below.
 
-```toml
-# /etc/zerofs/zerofs.toml - Minimal config for GCP VMs
-[cache]
-dir = "/var/cache/zerofs"
-disk_size_gb = 10.0
+While the pair is Connected, the leader ships writes before acknowledging them, so unflushed acknowledged writes survive one node failure. In Solo mode, they have the standalone durability window. Setting `[filesystem] ignore_fsync = true` makes `fsync` a no-op and provides neither an object-store barrier nor a lineage check.
 
-[storage]
-url = "gs://my-bucket/zerofs-data"
-encryption_password = "your-secure-password"
+`force_recovery` is only for a handoff that cannot recover normally after every former participant is known dead. A live or partitioned peer may hold the only copy of an acknowledged tail or an in-flight writer-open request. Quiesce that host and its object-store requests first, then remove `force_recovery` after the recovery startup succeeds.
 
-[servers.nfs]
-addresses = ["0.0.0.0:2049"]
-
-# No [gcp] section needed - uses VM's attached service account automatically
-```
-
-**With Service Account Key File:**
-
-```toml
-# /etc/zerofs/zerofs.toml
-[cache]
-dir = "/var/cache/zerofs"
-disk_size_gb = 10.0
-
-[storage]
-url = "gs://my-bucket/zerofs-data"
-encryption_password = "your-secure-password"
-
-[gcp]
-service_account = "/path/to/service-account-key.json"
-
-[servers.nfs]
-addresses = ["0.0.0.0:2049"]
-```
-
-Or using `GOOGLE_APPLICATION_CREDENTIALS`:
-
-```bash
-export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account-key.json"
-zerofs run -c zerofs.toml
-```
-
-### High-Performance Configuration
-
-```toml
-# /etc/zerofs/zerofs-performance.toml
-[cache]
-dir = "/nvme/zerofs-cache"    # Use fast NVMe storage
-disk_size_gb = 100.0
-memory_size_gb = 16.0          # Large memory cache
-
-[storage]
-url = "s3://high-performance-bucket/data"
-encryption_password = "very-secure-password-here"
-
-[filesystem]
-max_size_gb = 500.0            # Optional: limit filesystem size
-compression = "lz4"            # Optional: "lz4" (default) or "zstd-{1-22}"
-
-[lsm]
-l0_max_ssts = 16               # Trigger compaction with fewer SST files
-max_unflushed_gb = 2.0         # Allow more data batching for better write throughput
-max_concurrent_compactions = 16  # Use more CPU cores for compaction
-flush_interval_secs = 60       # Flush less frequently for better throughput
-
-[aws]
-access_key_id = "your-key"
-secret_access_key = "your-secret"
-region = "us-east-1"
-
-[servers.nfs]
-addresses = ["0.0.0.0:2049"]
-
-[servers.nbd]
-addresses = ["0.0.0.0:10809"]
-unix_socket = "/tmp/zerofs-nbd.sock"  # Unix socket for better local performance
-```
-
-### S3-Compatible Services
+## S3-Compatible Examples
 
 <CodeGroup>
 
@@ -377,7 +418,10 @@ encryption_password = "secure-password"
 access_key_id = "minioadmin"
 secret_access_key = "minioadmin"
 endpoint = "https://minio.example.com"
-allow_http = "true"  # Set to true if using HTTP
+allow_http = "true"  # Quoted string "true", not a bare boolean
+
+[servers.nfs]
+addresses = ["0.0.0.0:2049"]
 ```
 
 ```toml {{ title: 'Cloudflare R2' }}
@@ -394,6 +438,9 @@ access_key_id = "your-r2-access-key"
 secret_access_key = "your-r2-secret-key"
 endpoint = "https://<account-id>.r2.cloudflarestorage.com"
 region = "auto"  # R2 uses "auto" for region
+
+[servers.nfs]
+addresses = ["0.0.0.0:2049"]
 ```
 
 </CodeGroup>
@@ -415,14 +462,12 @@ zerofs run -c zerofs.toml
 To change the encryption password:
 
 ```bash
-# Change password interactively
+# Reads the new password from stdin: type one line and press Enter, or pipe it
 zerofs change-password --config zerofs.toml
-
-# The command will:
-# 1. Prompt for the new password
-# 2. Update encrypted data with the new password
-# 3. You'll need to update the config file manually
+echo "newpassword" | zerofs change-password -c zerofs.toml
 ```
+
+The command reads exactly one line from stdin and re-wraps the stored encryption key with the new password. File data is not re-encrypted.
 
 <Note>
 After changing the password, update the `encryption_password` field in your configuration file.
@@ -430,7 +475,7 @@ After changing the password, update the `encryption_password` field in your conf
 
 ## Environment Variable Substitution
 
-Configuration values can reference environment variables using `${VAR}` syntax:
+Configuration values can reference environment variables using `$VAR` or `${VAR}` syntax:
 
 ```toml
 [storage]
@@ -442,10 +487,20 @@ access_key_id = "${AWS_ACCESS_KEY_ID}"
 secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
 ```
 
-This is useful for:
-- Keeping secrets out of configuration files
-- Using the same config across environments
-- Integration with secret management systems
+Substitution applies to these keys only; all other values are taken literally:
+
+- `url`, `encryption_password`, and `storage_class` under `[storage]`
+- `dir` under `[cache]`
+- `unix_socket` under `[servers.ninep]`, `[servers.nbd]`, and `[servers.rpc]`
+- `addresses` under `[servers.nfs]`, `[servers.ninep]`, `[servers.nbd]`, `[servers.rpc]`, `[servers.webui]`, and `[prometheus]`
+- every value in `[aws]`, `[azure]`, and `[gcp]`
+- `node_id`, `replication_listen`, and `peers` under `[replication]`
+
+For array values (`peers` and the `addresses` lists) each entry is expanded independently, so `peers = ["${PEER_A}", "${PEER_B}"]` substitutes each element on its own; a single variable is not split into multiple entries. Expansion runs on the whole string before an `addresses` entry is parsed as a socket address, so the host, the port, or the entire value may come from a variable: `addresses = ["${POD_IP}:2049"]` and `addresses = ["${BIND_ADDR}"]` are both valid.
+
+If a referenced variable is unset, the configuration fails to load with `Failed to expand environment variable`. A literal `$` in an expandable value (an encryption password, for example) must be written `$$`.
+
+This keeps secrets out of configuration files and lets the same file serve several environments.
 
 ## System Integration
 
@@ -455,7 +510,7 @@ Create `/etc/systemd/system/zerofs.service`:
 
 ```ini
 [Unit]
-Description=ZeroFS S3 Filesystem
+Description=ZeroFS filesystem
 After=network-online.target
 Wants=network-online.target
 
@@ -511,42 +566,12 @@ docker run -d \
   ghcr.io/barre/zerofs:latest run --config /config/zerofs.toml
 ```
 
-### Configuration Best Practices
-
-1. **Restrict permissions**: `chmod 600 /etc/zerofs/zerofs.toml`
-2. **Use environment variables for secrets**: Keep passwords out of config files
-3. **Version control**: Track config files (without secrets) in git
-4. **Use strong passwords**: Generate with `openssl rand -base64 32`
-5. **Separate environments**: Use different config files for dev/staging/prod
+Configuration files can contain the encryption password and storage credentials. Restrict their file permissions and do not commit secrets to version control. Environment-variable substitution is available when the deployment's secret-management mechanism supplies values that way.
 
 ## Logging Configuration
 
-Set log levels using the `RUST_LOG` environment variable:
+Set log levels using the `RUST_LOG` environment variable. With `RUST_LOG` unset, `zerofs run` logs at `info` for all crates; `zerofs mount` uses `info,fuser::reply=off`. Logs are written to stderr.
 
 ```bash
-# Set log level (default: error,zerofs=info)
-export RUST_LOG='zerofs=debug'
-
-# Common log levels:
-# - error: Only errors
-# - warn: Warnings and errors
-# - info: Informational messages (default for zerofs)
-# - debug: Detailed debugging
-# - trace: Very detailed tracing
-
-# Run with custom logging
 RUST_LOG=zerofs=debug zerofs run -c zerofs.toml
 ```
-
----
-
-## Next Steps
-
-<div className="not-prose mt-6 flex gap-3">
-  <Button href="/quickstart" arrow="right">
-    Get started with ZeroFS
-  </Button>
-  <Button href="/troubleshooting" variant="outline">
-    Troubleshooting guide
-  </Button>
-</div>

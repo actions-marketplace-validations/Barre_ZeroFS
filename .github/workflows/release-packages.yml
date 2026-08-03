@@ -1,0 +1,185 @@
+name: Publish userspace packages
+
+# Builds userspace packages from the PGO release archive and publishes the
+# signed repositories described in packaging/README.md.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to (re)publish packages for, e.g. v1.4.1"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  # Repo metadata is read-modify-write against the bucket; never publish two at once.
+  group: release-packages
+  cancel-in-progress: false
+
+env:
+  NFPM_VERSION: "2.47.0"
+  NFPM_SHA256: "0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783"
+
+jobs:
+  resolve-release:
+    name: Resolve release
+    runs-on: ubuntu-26.04
+    outputs:
+      source-date-epoch: ${{ steps.release.outputs.source_date_epoch }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - name: Verify release version
+        id: release
+        env:
+          REQUESTED_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          TAG=$REQUESTED_TAG
+          git check-ref-format "refs/tags/$TAG" >/dev/null
+          git show-ref --verify --quiet "refs/tags/$TAG" || {
+            echo "release tag does not exist: $TAG" >&2
+            exit 1
+          }
+          [[ "$(git rev-parse HEAD)" == "$(git rev-list -n 1 "$TAG")" ]] || {
+            echo "checked-out commit does not match release tag $TAG" >&2
+            exit 1
+          }
+          VERSION=$(python3 - <<'PY'
+          import tomllib
+
+          with open("zerofs/Cargo.toml", "rb") as cargo_toml:
+              print(tomllib.load(cargo_toml)["workspace"]["package"]["version"])
+          PY
+          )
+          if [[ "$TAG" != "v$VERSION" ]]; then
+            echo "release tag $TAG does not match zerofs version $VERSION" >&2
+            exit 1
+          fi
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "source_date_epoch=$(git show -s --format=%ct HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+  userspace-packages:
+    name: Build userspace packages
+    needs: resolve-release
+    runs-on: ubuntu-26.04
+    env:
+      SOURCE_DATE_EPOCH: ${{ needs['resolve-release'].outputs['source-date-epoch'] }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs['resolve-release'].outputs.tag }}
+          persist-credentials: false
+
+      - name: Install package tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gettext-base rpm
+          mkdir -p "$HOME/.local/bin"
+          nfpm_archive="$RUNNER_TEMP/nfpm.tar.gz"
+          curl -fsSL \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+            -o "$nfpm_archive"
+          echo "$NFPM_SHA256  $nfpm_archive" | sha256sum --check -
+          tar xzf "$nfpm_archive" -C "$HOME/.local/bin" nfpm
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Download release binaries
+        run: |
+          # Same source the Docker build pulls from: the release tarball asset.
+          mkdir -p bin
+          curl -fsSL \
+            "https://github.com/${{ github.repository }}/releases/download/${{ needs['resolve-release'].outputs.tag }}/zerofs-pgo-multiplatform.tar.gz" \
+            | tar xz -C bin zerofs-linux-amd64-pgo zerofs-linux-arm64-pgo
+          chmod +x bin/zerofs-linux-*-pgo
+
+      - name: Build packages
+        run: |
+          mkdir -p out
+          build() {  # $1 = nfpm arch, $2 = binary path
+            export ARCH="$1" VERSION="${{ needs['resolve-release'].outputs.version }}" BIN="$2"
+            # shellcheck disable=SC2016
+            envsubst '${ARCH} ${VERSION} ${BIN}' < packaging/nfpm.yaml > nfpm.rendered.yaml
+            nfpm pkg -f nfpm.rendered.yaml -p deb -t out/
+            nfpm pkg -f nfpm.rendered.yaml -p rpm -t out/
+          }
+          build amd64 bin/zerofs-linux-amd64-pgo
+          build arm64 bin/zerofs-linux-arm64-pgo
+          ls -l out/
+
+          architectures=$(
+            for package in out/*.deb; do
+              dpkg-deb -f "$package" Architecture
+            done | sort -u | xargs
+          )
+          [[ "$architectures" == "amd64 arm64" ]] || {
+            echo "userspace DEBs do not cover amd64 and arm64 exactly" >&2
+            exit 1
+          }
+
+          architectures=$(
+            for package in out/*.rpm; do
+              rpm -qp --qf '%{ARCH}\n' "$package"
+            done | sort -u | xargs
+          )
+          [[ "$architectures" == "aarch64 x86_64" ]] || {
+            echo "userspace RPMs do not cover x86_64 and aarch64 exactly" >&2
+            exit 1
+          }
+
+      - name: Upload userspace packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: zerofs-userspace-packages-${{ needs['resolve-release'].outputs.version }}
+          path: out
+          if-no-files-found: error
+
+  publish-apt:
+    name: Publish userspace APT repository
+    needs: [resolve-release, userspace-packages]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_publish-repo.yml
+    with:
+      family: deb
+      prefix: deb
+      artifact-name: zerofs-userspace-packages-${{ needs['resolve-release'].outputs.version }}
+      architectures: amd64 arm64
+      probe-package: zerofs
+      probe-version: ${{ needs['resolve-release'].outputs.version }}
+    secrets:
+      GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+  publish-yum:
+    name: Publish userspace YUM repository
+    needs: [resolve-release, publish-apt]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_publish-repo.yml
+    with:
+      family: rpm
+      prefix: rpm
+      artifact-name: zerofs-userspace-packages-${{ needs['resolve-release'].outputs.version }}
+      architectures: x86_64 aarch64
+      probe-package: zerofs
+      probe-version: ${{ format('{0}-1', needs['resolve-release'].outputs.version) }}
+      descriptor-key: zerofs.repo
+    secrets:
+      GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}

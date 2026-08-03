@@ -1,10 +1,10 @@
 name: stress-ng
 
 on:
-  push:
-    branches: ["main"]
-  pull_request:
-    branches: ["main"]
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   stress-ng-nfs:
@@ -48,9 +48,12 @@ jobs:
           ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
           ./mc mb myminio/zerofs-stress-test || true
 
-      - name: Build ZeroFS
-        working-directory: zerofs
-        run: cargo build --profile ci
+      - name: Fetch the prebuilt ZeroFS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: zerofs-ci-bin
+          path: zerofs/target/ci
+      - run: chmod +x zerofs/target/ci/zerofs
 
       - name: Start ZeroFS
         working-directory: zerofs
@@ -77,6 +80,9 @@ jobs:
           secret_access_key = "minioadmin"
           endpoint = "http://localhost:9000"
           allow_http = "true"
+
+          [telemetry]
+          enabled = false
           EOF
 
           # Start ZeroFS in the background
@@ -109,15 +115,11 @@ jobs:
           # Verify mount
           mount | grep zerofs
 
-      - name: Run stress-ng test
+      - name: Run filesystem metadata stress test
+        timeout-minutes: 10
         run: |
           cd /mnt/zerofs-nfs
-          sudo stress-ng --access 1 --chdir 1 --chmod 1 --chown 1  \
-          --dentry 1 --dir 1 --dirdeep 1 --dirmany 1 --dup 1 --eventfd 1 \
-          --fd-fork 1 --filename 1 --fstat 1 \
-          --getdent 1 --link 1  \
-          --metamix 1 --open 1 --rename 1 --symlink 1  \
-          --touch 1 --utime 1 --timeout 60s
+          sudo stress-ng --job "$GITHUB_WORKSPACE/.github/stress-ng-filesystem.job"
 
       - name: Cleanup
         if: always()
@@ -129,7 +131,191 @@ jobs:
           pkill -f "zerofs run -c zerofs-ci.toml" || true
 
   stress-ng-9p:
-    name: Run stress-ng fstat test on 9P
+    name: Run filesystem metadata stress test (${{ matrix.client }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - client: v9fs
+            os: ubuntu-latest
+            guest: 0
+          - client: native
+            os: ubuntu-26.04
+            guest: 1
+    env:
+      ZEROFS_CI_GUEST: ${{ matrix.guest }}
+    defaults:
+      run:
+        shell: bash kernel/ci/ci-shell.sh {0}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the prebuilt ZeroFS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: zerofs-ci-bin
+          path: zerofs/target/ci
+
+      - name: Make the ZeroFS binary executable
+        shell: bash
+        run: chmod +x zerofs/target/ci/zerofs
+
+      - name: Cache the Ubuntu guest image
+        if: matrix.client == 'native'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.tool_cache }}/zerofs-qemu/ubuntu-26.04-server-cloudimg-amd64-20260720.img
+          key: zerofs-qemu-ubuntu-26.04-amd64-20260720
+
+      - name: Start native-client guest
+        if: matrix.client == 'native'
+        shell: bash
+        run: ./kernel/ci/qemu-vm.sh start
+
+      - name: Load native kernel client
+        if: matrix.client == 'native'
+        run: ./kernel/ci/native-kmod.sh load
+
+      - name: Start MinIO
+        run: |
+          sudo docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+
+          # Wait for MinIO to be ready
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y stress-ng
+
+      - name: Load v9fs kernel modules
+        if: matrix.client == 'v9fs'
+        run: |
+          # Check if 9p kernel module is available
+          sudo modprobe 9p
+          sudo modprobe 9pnet
+          sudo modprobe 9pnet_virtio
+
+          # List loaded 9p modules
+          lsmod | grep 9p || echo "No 9p modules loaded yet"
+
+      - name: Setup MinIO bucket
+        run: |
+          # Install mc (MinIO client)
+          wget https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x mc
+          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
+          ./mc mb myminio/zerofs-stress-test || true
+
+      - name: Start ZeroFS with 9P support
+        run: |
+          cd zerofs
+
+          # Create cache directory
+          mkdir -p /tmp/zerofs-cache
+
+          # Create ZeroFS configuration
+          cat > zerofs-ci.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache"
+          disk_size_gb = 1.0
+          memory_size_gb = 2.0
+
+          [storage]
+          url = "s3://zerofs-stress-test/test"
+          encryption_password = "test-password-123"
+
+          [servers.ninep]
+          addresses = ["127.0.0.1:5564"]
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+
+          [telemetry]
+          enabled = false
+          EOF
+
+          # Start ZeroFS in the background with 9P enabled
+          ./target/ci/zerofs run -c zerofs-ci.toml &
+
+          # Wait for ZeroFS to start (9P runs on port 5564)
+          echo "Waiting for ZeroFS 9P server to start..."
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 5564 2>/dev/null; then
+              echo "ZeroFS 9P server is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Verify ZeroFS is running
+          if ! nc -z 127.0.0.1 5564 2>/dev/null; then
+            echo "ZeroFS 9P server failed to start"
+            exit 1
+          fi
+
+      - name: Mount filesystem with v9fs
+        if: matrix.client == 'v9fs'
+        run: |
+          # Create mount point
+          sudo mkdir -p /mnt/zerofs-9p
+
+          # Mount ZeroFS via 9P using v9fs
+          sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,access=user 127.0.0.1 /mnt/zerofs-9p
+
+          # Verify mount
+          mount | grep zerofs-9p
+
+      - name: Mount filesystem with the native client
+        if: matrix.client == 'native'
+        run: |
+          sudo mkdir -p /mnt/zerofs-9p
+          sudo mount -t zerofs -o consistency=relaxed,msize=10485760 \
+            127.0.0.1:5564 /mnt/zerofs-9p
+          [[ $(findmnt -nr -o FSTYPE /mnt/zerofs-9p) == zerofs ]]
+
+      - name: Run filesystem metadata stress test
+        timeout-minutes: 10
+        run: |
+          cd /mnt/zerofs-9p
+          sudo stress-ng --job "$GITHUB_WORKSPACE/.github/stress-ng-filesystem.job"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Unmount
+          sudo umount /mnt/zerofs-9p || true
+
+          # Kill ZeroFS
+          pkill -f "zerofs run -c zerofs-ci.toml" || true
+
+      - name: Unload native kernel client
+        if: always() && matrix.client == 'native'
+        run: ./kernel/ci/native-kmod.sh unload
+
+      - name: Stop native-client guest
+        if: always() && matrix.client == 'native'
+        shell: bash
+        run: ./kernel/ci/qemu-vm.sh stop
+
+  stress-ng-fuse:
+    name: Run stress-ng test on zerofs mount (FUSE)
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -159,15 +345,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y stress-ng
-
-          # Check if 9p kernel module is available
-          sudo modprobe 9p
-          sudo modprobe 9pnet
-          sudo modprobe 9pnet_virtio
-
-          # List loaded 9p modules
-          lsmod | grep 9p || echo "No 9p modules loaded yet"
+          sudo apt-get install -y stress-ng fuse3
 
       - name: Setup MinIO bucket
         run: |
@@ -177,9 +355,12 @@ jobs:
           ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
           ./mc mb myminio/zerofs-stress-test || true
 
-      - name: Build ZeroFS
-        working-directory: zerofs
-        run: cargo build --profile ci
+      - name: Fetch the prebuilt ZeroFS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: zerofs-ci-bin
+          path: zerofs/target/ci
+      - run: chmod +x zerofs/target/ci/zerofs
 
       - name: Start ZeroFS with 9P support
         working-directory: zerofs
@@ -206,6 +387,9 @@ jobs:
           secret_access_key = "minioadmin"
           endpoint = "http://localhost:9000"
           allow_http = "true"
+
+          [telemetry]
+          enabled = false
           EOF
 
           # Start ZeroFS in the background with 9P enabled
@@ -227,32 +411,34 @@ jobs:
             exit 1
           fi
 
-      - name: Mount 9P filesystem
+      - name: Mount with zerofs mount (FUSE)
+        working-directory: zerofs
         run: |
-          # Create mount point
-          sudo mkdir -p /mnt/zerofs-9p
+          sudo mkdir -p /mnt/zerofs-fuse
 
-          # Mount ZeroFS via 9P using v9fs
-          sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,access=user 127.0.0.1 /mnt/zerofs-9p
+          # Mount as root with --access all so the root-run stress test can use it.
+          sudo ./target/ci/zerofs mount --access all 127.0.0.1:5564 /mnt/zerofs-fuse &
 
-          # Verify mount
-          mount | grep zerofs-9p
+          echo "Waiting for the FUSE mount..."
+          for i in {1..60}; do
+            mountpoint -q /mnt/zerofs-fuse && break
+            sleep 0.5
+          done
+          mountpoint -q /mnt/zerofs-fuse || { echo "FUSE mount failed"; exit 1; }
+          mount | grep zerofs-fuse
 
-      - name: Run stress-ng fstat test
+      - name: Run filesystem metadata stress test
+        timeout-minutes: 10
         run: |
-          cd /mnt/zerofs-9p
-          sudo stress-ng --access 1 --chdir 1 --chmod 1 --chown 1  \
-            --dentry 1 --dir 1 --dirdeep 1 --dirmany 1 --dup 1 --eventfd 1 \
-            --fd-fork 1 --filename 1 --fstat 1 \
-            --getdent 1 --link 1  \
-            --metamix 1 --open 1 --rename 1 --symlink 1  \
-            --touch 1 --utime 1 --timeout 60s
+          cd /mnt/zerofs-fuse
+          sudo stress-ng --job "$GITHUB_WORKSPACE/.github/stress-ng-filesystem.job"
 
       - name: Cleanup
         if: always()
         run: |
-          # Unmount
-          sudo umount /mnt/zerofs-9p || true
+          # Unmount the FUSE client and stop its process
+          sudo fusermount3 -u /mnt/zerofs-fuse || sudo umount /mnt/zerofs-fuse || true
+          sudo pkill -f "zerofs mount" || true
 
           # Kill ZeroFS
           pkill -f "zerofs run -c zerofs-ci.toml" || true

@@ -165,12 +165,81 @@ impl RpcClient {
         Ok(response.into_inner())
     }
 
+    pub async fn watch_object_access(&self) -> Result<Streaming<proto::ObjectAccessEvent>> {
+        let request = proto::WatchObjectAccessRequest {};
+
+        let response = self
+            .client
+            .clone()
+            .watch_object_access(request)
+            .await
+            .map_err(|s| anyhow!("Failed to start object access stream: {}", s.message()))?;
+
+        Ok(response.into_inner())
+    }
+
+    pub async fn stream_stats(&self, interval_ms: u32) -> Result<Streaming<proto::StatsSnapshot>> {
+        let request = proto::StreamStatsRequest { interval_ms };
+
+        let response = self
+            .client
+            .clone()
+            .stream_stats(request)
+            .await
+            .map_err(|s| anyhow!("Failed to start stats stream: {}", s.message()))?;
+
+        Ok(response.into_inner())
+    }
+
     pub async fn flush(&self) -> Result<()> {
         let request = proto::FlushRequest {};
 
         self.client
             .clone()
             .flush(request)
+            .await
+            .map_err(|s| anyhow!("{}", s.message()))?;
+
+        Ok(())
+    }
+
+    /// Test helper for the admin create-directory RPC.
+    #[cfg(test)]
+    pub async fn create_directory(
+        &self,
+        path: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<bool> {
+        let request = proto::CreateDirectoryRequest {
+            path: path.to_string(),
+            mode,
+            uid,
+            gid,
+        };
+
+        let response = self
+            .client
+            .clone()
+            .create_directory(request)
+            .await
+            .map_err(|s| anyhow!("{}", s.message()))?
+            .into_inner();
+
+        Ok(response.created)
+    }
+
+    /// Test helper for the admin remove-directory RPC.
+    #[cfg(test)]
+    pub async fn remove_directory(&self, path: &str) -> Result<()> {
+        let request = proto::RemoveDirectoryRequest {
+            path: path.to_string(),
+        };
+
+        self.client
+            .clone()
+            .remove_directory(request)
             .await
             .map_err(|s| anyhow!("{}", s.message()))?;
 

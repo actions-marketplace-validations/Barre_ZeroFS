@@ -1,215 +1,92 @@
 export const metadata = {
   title: 'Durability & Consistency',
   description:
-    'Technical documentation of ZeroFS durability guarantees, write atomicity, ordering semantics, and consistency model.',
+    'ZeroFS write atomicity, ordering, flush behavior, crash recovery, and backend durability.',
 }
 
 # Durability & Consistency
 
-This document describes the durability and consistency guarantees provided by ZeroFS, including write atomicity, operation ordering, and crash recovery semantics. {{ className: 'lead' }}
+ZeroFS makes each filesystem mutation visible atomically, orders mutations through one commit path, and persists them through explicit or periodic flush barriers. {{ className: 'lead' }}
 
 ## Overview
 
-ZeroFS implements a transactional storage model using an LSM-tree database designed for object storage backends. This architecture provides three key properties:
+File contents live as compressed, encrypted frames inside immutable segment objects. Metadata—including inodes, directory entries, and one 32-byte `FrameLoc` per 32 KiB extent—lives in an object-backed LSM tree. The recovered state after a crash is an atomic prefix of the mutations that were visible before the crash. An explicit durability barrier determines which prefix must survive.
 
-1. **Write Atomicity**: All filesystem operations are atomic at the transaction level
-2. **Strict Ordering**: Operations are totally ordered and this order is preserved across crashes
-3. **Instant Recovery**: No filesystem check or journal replay is required after unexpected termination
+Startup reads the latest durable manifest; it does not replay a journal or run a filesystem repair pass.
 
 ## Write Atomicity
 
-Each filesystem operation executes within a single database transaction. A transaction bundles all related modifications into an atomic unit that either commits entirely or has no effect.
+Each filesystem mutation executes in one database transaction. A write transaction contains its extent pointers, per-segment accounting changes, inode metadata, directory changes, and global statistics updates. The extent bytes are compressed, encrypted, and appended to the in-memory open segment while the transaction is staged; the foreground write does not issue an object-store PUT.
 
-<Row>
-  <Col>
+The transaction's metadata changes commit as one `WriteBatch`. The possible outcomes are:
 
-    ### Transaction Scope
+| Event | Visible state |
+| --- | --- |
+| Failure before commit | None of the mutation is visible. |
+| Commit with an uncertain outcome | The complete mutation is visible or absent; no partial transaction is exposed. |
+| Crash before a durability barrier | A previously visible mutation can be absent after restart, but only as part of an atomic unflushed suffix. |
+| Crash after a completed durability barrier | The complete mutation is present after restart. |
 
-    A write operation includes the following modifications within a single transaction:
-
-    - File data chunks
-    - Inode metadata (size, timestamps, mode)
-    - Directory entry updates
-    - Global statistics counters
-
-    The database commits these changes using a WriteBatch, which provides all-or-nothing semantics. Partial writes cannot occur.
-
-    ### Failure Modes
-
-    | Event | Outcome |
-    |-------|---------|
-    | Crash before commit | Transaction discarded, no changes visible |
-    | Crash during commit | Transaction discarded, no changes visible |
-    | Crash after commit | All changes visible |
-
-    The intermediate state where some but not all modifications are visible is not possible.
-
-  </Col>
-  <Col>
-
-    ```rust {{ title: 'Transaction Structure' }}
-    // Create transaction
-    let mut txn = db.new_transaction();
-
-    // Bundle all modifications
-    chunk_store.write(&mut txn, id, offset, data);
-
-    inode.size = new_size;
-    inode.mtime = now;
-    inode_store.save(&mut txn, id, &inode);
-
-    directory_store.update_entry(&mut txn, ...);
-
-    // Atomic commit
-    db.write(txn).await;
-    ```
-
-  </Col>
-</Row>
+Frames left in a segment without committed pointers are unreachable and are reclaimed later. A transaction never exposes only some of its metadata or extent pointers.
 
 ## Operation Ordering
 
-ZeroFS provides a total order over all write operations. This order is preserved exactly across process termination and restart.
+All write transactions pass through one commit worker. It drains pending transactions, merges them into an atomic batch, and submits batches in order. Per-inode locks serialize mutations that inspect the same file or directory; the commit worker is the sole writer of global statistics and per-segment counters.
 
-<Row>
-  <Col>
+If operation A completes before operation B begins, B is submitted in a later batch. Therefore:
 
-    ### Ordering Guarantee
+```
+visible(B) → visible(A)
+```
 
-    The WriteCoordinator assigns monotonically increasing sequence numbers to operations. Each operation must wait for all predecessors to complete before committing:
-
-    ```rust
-    let seq = write_coordinator.allocate_sequence();
-    seq.wait_for_predecessors().await;
-    db.write(txn).await;
-    seq.mark_committed();
-    ```
-
-    This mechanism ensures that if operation A completes before operation B begins, then in any consistent state of the filesystem, the visibility of B implies the visibility of A.
-
-    ### Formal Property
-
-    For operations A and B where A completes before B starts:
-
-    ```
-    visible(B) → visible(A)
-    ```
-
-    The contrapositive also holds: if A is not visible, B cannot be visible.
-
-  </Col>
-  <Col>
-
-    ### Comparison with Other Filesystems
-
-    Many filesystems permit write reordering for performance optimization:
-
-    - **ext4**: May reorder writes within journal transactions
-    - **XFS**: Delayed allocation can reorder data relative to metadata
-    - **Hardware**: SSDs and disk controllers may reorder writes internally
-
-    Such reordering can result in states where a later write is visible while an earlier write is not. Applications that depend on ordering semantics (databases, logging systems, configuration management) may observe inconsistent state after recovery.
-
-    ZeroFS eliminates this class of problems by construction. The sequence number mechanism enforces a total order that survives crashes.
-
-  </Col>
-</Row>
+After a crash, the recovered durable state preserves a prefix of that order. It cannot contain B while omitting an earlier completed A. Mutations in the unflushed suffix may all be absent.
 
 ## Crash Recovery
 
-ZeroFS requires no recovery procedure after unexpected termination.
+SSTs and segment objects are immutable. Each segment frame has an authenticated-encryption tag, while the segment footer includes a CRC32C for torn-write detection.
 
-<Row>
-  <Col>
+A flush uploads the open data segment before flushing metadata that refers to it. A durable manifest therefore never points to an unuploaded segment. A crash between those steps can leave an unreferenced segment object, which garbage collection later removes, but not a durable dangling extent pointer.
 
-    ### Recovery-Free Design
-
-    The underlying storage model has several properties that eliminate the need for crash recovery:
-
-    **Atomic Commits**: WriteBatch operations are atomic at the database level. A transaction either appears in full or not at all.
-
-    **Immutable Storage**: SST files written to object storage are immutable. Once uploaded, they cannot be corrupted by subsequent operations.
-
-    **Self-Describing State**: The database manifest describes the complete set of valid SST files. On startup, ZeroFS reads the manifest and has immediate access to the latest consistent state.
-
-    **Write-Ahead Log (WAL)**: WAL is enabled by default to reduce compaction overhead from frequent fsyncs (see [Configuration Guide](/configuration) for details). Whether WAL is enabled or disabled does not affect durability guarantees. When enabled, any WAL entries since the last SST flush are replayed on startup — this only covers data not yet flushed to SSTs, so recovery remains fast.
-
-  </Col>
-  <Col>
-
-    ### Startup Procedure
-
-    After any termination (graceful or unexpected):
-
-    1. Read manifest from object storage
-    2. Load database state from referenced SST files
-    3. Resume operation
-
-    No scanning, replay, or repair is performed. The time to resume operation is independent of filesystem size or the nature of the previous termination.
-
-  </Col>
-</Row>
+On startup, ZeroFS reads the latest manifest and opens the referenced SSTs. It does not scan the namespace, replay a filesystem journal, or run an fsck-style repair step.
 
 ## Durability Semantics
 
-ZeroFS follows standard POSIX durability semantics. Write operations are buffered in memory and persisted to durable storage upon explicit synchronization.
+Ordinary writes can return while file data remains in the in-memory open segment and metadata remains in the LSM memtable. The open segment is also sealed in the background when it reaches 256 MiB; at most four uploads run concurrently.
 
-<Row>
-  <Col>
+A flush runs under one barrier: it seals and uploads the open segment, then flushes the metadata memtable. If the segment seal or upload fails, metadata is not flushed. A flush occurs when:
 
-    ### Buffering Model
+- a client requests durability (`fsync`, NFS COMMIT, or NBD FLUSH/FUA);
+- the periodic interval elapses (`flush_interval_secs`, 30 seconds by default, 5 seconds minimum);
+- a batch completes with `sync_writes = true`;
+- segment garbage collection begins; or
+- the process shuts down gracefully.
 
-    Write data flows through the following stages:
+There is no independent memtable-capacity flush. Applications that require a particular write to survive a crash must use the synchronization operation provided by their access protocol, subject to the protocol differences below.
 
-    1. **Application Buffer**: User-space buffers managed by the application
-    2. **Page Cache**: OS-managed in-memory buffers
-    3. **Memtable**: In-memory LSM tree buffer
-    4. **SST Files**: Immutable files in object storage
+## Verified fsync
 
-    Data moves from memtable to SST files when:
-    - The application calls `fsync()`
-    - The memtable reaches capacity
-    - The process terminates gracefully
-    - Periodic background flushes
+A successful `fsync` is verified: it means every write the descriptor acknowledged before it is durable on object storage. Acknowledged file data lives in the in-RAM open segment buffer, and its metadata in the memtable, until the next flush, so a crash before that flush loses them. ZeroFS does not let that loss pass silently. A `fsync` issued after a restart, over writes made before it, returns a stale-handle error (`ESTALE`) rather than a false success.
 
-    ### POSIX Compliance
+Each acknowledged write is tagged with a durability *lineage token* naming the current unbroken durable lineage. A restart reopens the database and, with no way to prove it inherited the un-flushed buffers, regenerates the token. A `fsync` presents the token its writes were made under; if the database has since regenerated, the tokens differ and the `fsync` fails. The first `fsync` after a write is the durability boundary, so a failure reports real loss: redo the writes and `fsync` again.
 
-    This behavior conforms to POSIX semantics, which specify that `write()` transfers data to system buffers while `fsync()` ensures data reaches stable storage. All major filesystems (ext4, XFS, APFS, ZFS...) implement this model.
+This holds on a single node and under replication alike. With a replicated standby a clean failover can prove it inherited the writes (the standby receives un-flushed extent frames over replication and materializes their segments at takeover) and keeps the token, so the `fsync` succeeds transparently; the failover cases are diagrammed in [High availability](/high-availability). The check is per descriptor and matches POSIX: it covers the whole file across every open handle, speaks for no other file, and verifies data, metadata, directory entries, and `rename`.
 
-  </Col>
-  <Col>
+## Eliminating the Durability Window
 
-    ### Synchronization API
+By default, writes between fsync calls live in the open segment buffer and memtable and become durable only when the next periodic flush or explicit fsync persists them. Committed-but-unflushed file data is bounded by the 256 MiB open buffer plus up to 4 × 256 MiB of in-flight segment uploads. For workloads that need every write durable on return, set `sync_writes = true` in the `[lsm]` section.
 
-    ```c
-    // POSIX interface
-    write(fd, data, len);   // Buffer in memory
-    fsync(fd);              // Persist to storage
-    ```
+When enabled, the commit coordinator forces a flush after every coalesced write batch before returning success to the caller. Concurrent writes still merge into a single batch and a single flush.
 
-    ```python
-    # Python
-    f.write(data)
-    f.flush()
-    os.fsync(f.fileno())
-    ```
+<Note>
+This flag does not change `fsync` behavior. With `sync_writes = false` (the default), explicit `fsync` from clients is still honored and waits for durable persistence. The flag only governs what happens to writes *between* fsync calls.
+</Note>
 
-    ```go
-    // Go
-    f.Write(data)
-    f.Sync()
-    ```
+The trade-off is per-operation latency. Each batch waits for the full durability barrier: the open segment is sealed and uploaded, then the memtable flushes to an L0 SST. This is expensive for chatty workloads.
 
-    ```rust
-    // Rust
-    file.write_all(data)?;
-    file.sync_all()?;
-    ```
-
-    Applications requiring immediate durability must call the appropriate synchronization function.
-
-  </Col>
-</Row>
+```toml
+[lsm]
+sync_writes = true
+```
 
 ## Protocol Considerations
 
@@ -222,11 +99,9 @@ The durability guarantees available to applications depend on the access protoco
 
     The 9P protocol provides direct mapping of POSIX synchronization semantics:
 
-    - `fsync()` system call generates a `Tfsync` protocol message
-    - ZeroFS flushes all buffered data to object storage
-    - The call returns only after durability is confirmed
-
-    This provides strong guarantees suitable for applications with strict durability requirements.
+    - `fsync()` issues a durability-verified flush (`Tfsyncdur`, a ZeroFS 9P extension negotiated by `zerofs mount` and the client libraries)
+    - ZeroFS flushes all buffered data to object storage, then verifies the writes' lineage; the call returns success only when durability is confirmed, otherwise `ESTALE` (see [Verified fsync](#verified-fsync))
+    - Plain 9P2000.L clients (e.g. the Linux kernel v9fs client) issue `Tfsync`: a durable but unverified flush. With `ignore_fsync`, both standard and durability-verified fsync requests return without forcing a flush; selecting that option explicitly opts out of the guarantee.
 
   </Col>
   <Col>
@@ -257,46 +132,55 @@ ZeroFS verifies its consistency guarantees through systematic crash simulation u
 
     | Operation | Failpoints |
     |-----------|------------|
-    | write | after chunk write, after inode update, after commit |
+    | write | after extent write, after inode update, after commit |
+    | fallocate | after extent edits, after inode update, after commit |
     | create | after inode allocation, after directory entry, after commit |
     | remove | after inode delete, after tombstone, after directory unlink, after commit |
     | rename | after target delete, after source unlink, after new entry, after commit |
     | mkdir | after inode allocation, after directory entry, after commit |
-    | truncate | after chunk deletion, after inode update, after commit |
+    | truncate | after extent deletion, after inode update, after commit |
     | link | after directory entry, after inode update, after commit |
     | symlink | after inode allocation, after directory entry, after commit |
     | rmdir | after inode delete, after directory cleanup |
-    | gc | after chunk delete, after tombstone update |
+    | gc | after extent delete, after tombstone update |
+    | flush | after segment seal, before manifest flush |
+    | segment compaction | after packed-segment seal, before repoint; between per-inode repoints |
+    | segment reclaim | after barrier, before scan; after verify, before delete; after segment delete, before counter drop |
+    | seal | forced open-segment seal error |
 
-    Each failpoint triggers an immediate process termination, simulating power loss or crash at that exact point.
+    Fallocate exposes these boundaries as `fallocate_after_extents`, `fallocate_after_inode`, and `fallocate_after_commit`. Its focused atomicity test verifies that aborting at either pre-commit point discards the staged extent and inode changes, while aborting after commit leaves the complete range operation visible.
+
+    The crash-harness failpoints abort the operation at the injection point; the filesystem instance is torn down (discarding all in-memory state) and restarted from object storage, simulating a crash at that exact point. The seal failpoint injects an error return instead, verifying that a failed seal leaves the open buffer intact for retry rather than committing dangling pointers.
 
   </Col>
   <Col>
 
     ### Consistency Verification
 
-    After each simulated crash, a comprehensive consistency checker validates the filesystem state:
+    After each simulated crash, a consistency checker validates the filesystem state:
 
     ```rust {{ title: 'Consistency Checks' }}
     verify_all()
       enumerate_inodes()
       enumerate_tombstones()
+      enumerate_orphans()
       walk_directory_tree()
       verify_directory_counts()
       verify_nlink_counts()
       verify_directory_nlinks()
       find_orphaned_inodes()
+      verify_orphan_set_drained()
       verify_stats_counters()
       verify_tombstones()
-      verify_file_chunks()
+      verify_file_extents()
       verify_inode_counter()
-      verify_orphaned_chunks()
+      verify_orphaned_extents()
       verify_dir_entry_scan_consistency()
       verify_orphaned_directory_metadata()
       verify_dir_cookie_counters()
     ```
 
-    The checker detects: dangling references, orphaned inodes, nlink mismatches, missing chunks, stale tombstones, counter inconsistencies, and directory entry corruption.
+    The checker detects: dangling references, orphaned inodes, nlink mismatches, missing extents, stale tombstones, counter inconsistencies, and directory entry corruption.
 
   </Col>
 </Row>
@@ -306,37 +190,85 @@ ZeroFS verifies its consistency guarantees through systematic crash simulation u
 For each failpoint, the test suite:
 
 1. Performs a filesystem operation with the failpoint enabled
-2. Terminates the process at the injection point
+2. Aborts the operation at the injection point and tears down the filesystem instance, discarding all in-memory state
 3. Restarts the filesystem from object storage
 4. Runs the full consistency checker
-5. Verifies either complete rollback or complete commit—never partial state
+5. Verifies either complete rollback or complete commit, never partial state
 
-This systematic approach ensures that the atomicity and ordering guarantees hold under all crash scenarios.
+This verifies that the atomicity and ordering guarantees hold at each injected crash point.
+
+## Deterministic Simulation Testing
+
+The data path, namespace mutations, garbage collection, compaction, and crash recovery also run under deterministic simulation. Each run uses a single-threaded runtime and virtual time. A seed assigns object-store latency and therefore the order in which concurrent tasks wake; replaying that seed reproduces the schedule. Fresh seeds accumulate coverage, while a companion test verifies that replay produces the same execution trace.
+
+Each simulated world runs several kinds of work concurrently:
+
+- file writes, truncates, hole punches, reads, scans, and fsyncs;
+- writers updating separate regions of one inode;
+- namespace changes, including rename, links, special nodes, and open-unlink cleanup; and
+- live garbage-collection passes.
+
+The simulation uses the production retry and durability paths over an in-memory object store. Some runs inject transient failures whose mutation succeeds but response is lost, forcing retries to meet an already-applied write. At a seeded point, the process crashes: tasks are cancelled, in-flight storage requests stop, and a new instance opens the surviving objects.
+
+At every quiesced point and after every crash, the state must satisfy a model-based oracle:
+
+1. Each ordinary file and shared-inode region equals the replay of an operation prefix no older than the last acknowledged fsync. One in-flight operation of unknown fate is permitted per actor at the cut, and the shared file's durable size is fixed.
+2. The namespace tree is structurally isomorphic to a prefix of its operation log: paths, node kinds and values, file contents, and hardlink identity must all match.
+3. Every referenced extent still resolves: the filesystem is re-read in full, so a dangling frame pointer or a wrongly deleted segment surfaces immediately. Modeled data files also require a key for every nonzero extent and reject keys beyond EOF.
+4. Segment accounting reconciles through typed snapshots: each counter's live bytes equal the byte sum of the extent pointers referencing it, live bytes never exceed appended bytes, and every referenced segment has a counter.
+5. All incremental footprint gauges (segment count, appended bytes, live bytes, and reclaimable bytes) equal an authoritative scan.
+6. The full consistency checker passes, including directory and link invariants, extent readability and EOF bounds, orphan metadata, inode and directory-cookie counters, and the global stats behind statfs.
+
+Garbage-collection passes run with seeded per-pass tuning so the rarely-taken paths execute too: checkpoint-pinned passes, the write-cold gates (tail scrub, chain compaction), small round budgets that exercise the gather caps, and multi-batch drains.
+
+A companion mode combines the simulation with failpoints for crash windows that contain no await point. It can pause between a garbage-collection decision and its irreversible action, allow concurrent commits to land, and then crash at that exact code location. The pointwise failpoint suite remains as a separate guard for each window.
+
+CI runs the simulation as a dedicated test target with the required SlateDB and Tokio configuration flags. A scheduled job additionally soaks fresh seeds for 50 minutes every hour.
+
+```bash {{ title: 'Running the simulation' }}
+export DST_RUSTFLAGS="--cfg dst --cfg tokio_unstable --cfg io_uring_skip_arch_check"
+RUSTFLAGS="$DST_RUSTFLAGS" cargo test --test dst
+
+# A timed soak: fresh random seeds, fanned across all cores, until the
+# budget elapses. Scale depth with DST_ROUNDS / DST_OPS / DST_CRASH_PCT.
+DST_WALL_CLOCK_SECS=3600 RUSTFLAGS="$DST_RUSTFLAGS" \
+  cargo test --test dst -- --nocapture seeds
+
+# Failpoint-placed crashes and widened windows
+RUSTFLAGS="$DST_RUSTFLAGS" \
+  cargo test --features failpoints --test dst crash_points
+
+# Reproduce a failure from its printed seed
+DST_SEEDS=16039913183294875603 RUSTFLAGS="$DST_RUSTFLAGS" \
+  cargo test --test dst -- --nocapture
+```
 
 ## Continuous Integration Testing
 
-In addition to crash simulation, ZeroFS runs extensive integration tests on every commit through multiple industry-standard test suites.
+In addition to crash simulation, CI runs pjdfstest, stress-ng, Linux kernel builds, Jepsen's local-fs suite, and a ZFS integration test on every commit.
 
 <Row>
   <Col>
 
     ### POSIX Compliance
 
-    **pjdfstest**: A POSIX filesystem compliance test suite originally developed for FreeBSD. Tests cover file creation, permissions, hard links, symbolic links, timestamps, and other POSIX semantics. Runs on both NFS and 9P protocols.
-
-    **xfstests**: The Linux kernel's filesystem test suite, originally developed for XFS but now used across all major Linux filesystems. Provides extensive coverage of edge cases, concurrent operations, and error handling.
+    **pjdfstest**: A POSIX filesystem compliance test suite originally developed for FreeBSD. Tests cover file creation, permissions, hard links, symbolic links, timestamps, and other POSIX semantics. 8,662 cases run once per protocol: NFS, 9P, and FUSE. A few cases per protocol are excluded; the exclude lists are public in the repo.
 
   </Col>
   <Col>
 
     ### Stress Testing
 
-    **stress-ng**: Exercises filesystem operations under concurrent load, including directory operations, file metadata, links, renames, and attribute modifications. Tests run for sustained periods on both NFS and 9P.
+    **stress-ng**: Exercises filesystem operations under concurrent load, including directory operations, file metadata, links, renames, and attribute modifications. Tests run over NFS, 9P, and FUSE.
 
-    **Linux Kernel Compilation**: Compiles the Linux kernel source tree on ZeroFS, exercising real-world workload patterns including parallel file creation, compilation, and linking across thousands of files.
+    **Linux Kernel Compilation**: Compiles the Linux kernel source tree on ZeroFS, exercising parallel file creation, compilation, and linking across thousands of files.
 
   </Col>
 </Row>
+
+### Model-Based Testing
+
+**Jepsen (local-fs)**: Generates random sequences of filesystem operations and checks each result against a reference model, shrinking any divergence to a minimal failing case. It runs over a 9P mount. A crash mode injects the loss of un-fsynced writes: it kills the server mid-run, dropping the in-memory open segment buffer and memtable, then recovers from the object store and verifies the surviving state is consistent with the last fsync.
 
 ### Layered Filesystem Testing
 
@@ -355,12 +287,13 @@ This test validates data integrity through multiple filesystem layers and across
 
 | Test Suite | Protocol | Coverage |
 |------------|----------|----------|
-| Unit tests | — | Core filesystem logic |
-| Failpoint crash tests | — | Crash consistency at each operation stage |
-| pjdfstest | NFS, 9P | POSIX compliance |
-| xfstests | NFS, 9P | Linux filesystem semantics |
-| stress-ng | NFS, 9P | Concurrent operations under load |
-| Kernel compilation | NFS, 9P | Real-world build workload |
+| Unit tests | n/a | Core filesystem logic |
+| Failpoint crash tests | n/a | Crash consistency at each operation stage |
+| Deterministic simulation | n/a | Data and namespace models, GC/compaction schedules, accounting invariants, and mid-flight crash recovery with exact replay |
+| Jepsen (local-fs) | 9P | Model-based correctness, crash consistency |
+| pjdfstest | NFS, 9P, FUSE | POSIX compliance |
+| stress-ng | NFS, 9P, FUSE | Concurrent operations under load |
+| Kernel compilation | NFS, 9P, FUSE | Parallel build workload |
 | ZFS integration | NBD + 9P | Block device integrity across restarts |
 
 All tests run on every pull request and merge to the main branch.
@@ -376,44 +309,16 @@ AWS S3, Azure Blob Storage, and Google Cloud Storage support conditional writes 
 conditional_put = "redis://localhost:6379"
 ```
 
-When configured, ZeroFS uses Redis to coordinate conditional write operations, providing the same fencing guarantees as native conditional put support. See the [Configuration Guide](/configuration) for details.
+When configured, ZeroFS uses Redis to coordinate conditional write operations, providing the same fencing guarantees as native conditional put support. See the [configuration reference](/configuration) for details.
 
 ## Backend Durability
 
 ZeroFS delegates storage durability to the object storage backend.
 
-| Backend | Designed Durability | Replication |
-|---------|---------------------|-------------|
-| Amazon S3 | 99.999999999% | Automatic across availability zones |
-| Azure Blob Storage | 99.999999999% | Configurable geo-redundancy |
-| Google Cloud Storage | 99.999999999% | Configurable multi-region |
+| Backend | What determines failure-domain coverage |
+| --- | --- |
+| [Amazon S3](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html) | Storage class and region; One Zone classes do not survive loss of their availability zone. |
+| [Azure Blob Storage](https://learn.microsoft.com/en-us/azure/storage/common/storage-redundancy) | The selected LRS, ZRS, GRS, GZRS, RA-GRS, or RA-GZRS redundancy option. |
+| [Google Cloud Storage](https://cloud.google.com/storage/docs/availability-durability) | Bucket location type and placement. |
 
-These services maintain multiple replicas across independent failure domains. Once data is persisted to object storage, it is protected against hardware failures, facility outages, and other localized events without additional configuration.
-
-## Summary
-
-ZeroFS provides the following durability and consistency guarantees:
-
-<Properties>
-  <Property name="Write Atomicity">
-    Filesystem operations are atomic. Each operation either completes fully or has no effect. Partial or torn writes are not possible.
-  </Property>
-  <Property name="Total Ordering">
-    All operations are assigned sequence numbers that define a total order. This order is preserved across crashes. If operation B is visible after recovery, all operations that completed before B started are also visible.
-  </Property>
-  <Property name="Immediate Recovery">
-    No recovery procedure is required after unexpected termination. The filesystem resumes operation by reading the current manifest from object storage.
-  </Property>
-  <Property name="POSIX Durability">
-    Data is persisted to stable storage upon fsync() invocation, consistent with POSIX semantics and the behavior of other filesystems.
-  </Property>
-  <Property name="Backend Replication">
-    Persisted data inherits the durability properties of the object storage backend, typically providing automatic replication across multiple failure domains.
-  </Property>
-</Properties>
-
-<div className="not-prose">
-  <Button href="/architecture" variant="text" arrow="right">
-    System architecture documentation
-  </Button>
-</div>
+ZeroFS considers a flush durable after the backend acknowledges the required object writes. The failures that acknowledgment protects against depend on the provider, storage class, region, and replication configuration; ZeroFS does not add another remote replica outside that configuration.

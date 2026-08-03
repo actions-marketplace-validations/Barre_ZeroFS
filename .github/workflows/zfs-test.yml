@@ -1,10 +1,10 @@
 name: ZFS on ZeroFS Test
 
 on:
-  push:
-    branches: ["main"]
-  pull_request:
-    branches: ["main"]
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   zfs-test:
@@ -45,9 +45,12 @@ jobs:
           ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
           ./mc mb myminio/zerofs-zfs-test || true
 
-      - name: Build ZeroFS
-        working-directory: zerofs
-        run: cargo build --profile ci
+      - name: Fetch the prebuilt ZeroFS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: zerofs-ci-bin
+          path: zerofs/target/ci
+      - run: chmod +x zerofs/target/ci/zerofs
 
       - name: Start ZeroFS
         working-directory: zerofs
@@ -77,6 +80,9 @@ jobs:
           secret_access_key = "minioadmin"
           endpoint = "http://localhost:9000"
           allow_http = "true"
+
+          [telemetry]
+          enabled = false
           EOF
 
           # Start ZeroFS with NBD support in the background
@@ -145,19 +151,19 @@ jobs:
       - name: Download and extract Linux kernel
         run: |
           # Download Linux kernel source
-          echo "Downloading Linux kernel 6.15.6..."
+          echo "Downloading Linux kernel 7.2-rc1..."
           cd /mnt/zfsdata
-          sudo wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.15.6.tar.xz
+          sudo wget -q https://git.kernel.org/torvalds/t/linux-7.2-rc1.tar.gz
 
           # Show download size
-          ls -lh linux-6.15.6.tar.xz
+          ls -lh linux-7.2-rc1.tar.gz
 
           echo "Extracting kernel source..."
-          time sudo tar -I pixz -xf linux-6.15.6.tar.xz
+          time sudo tar -I pigz -xf linux-7.2-rc1.tar.gz
 
           # Count files to verify extraction
           echo "Counting extracted files..."
-          sudo find linux-6.15.6 -type f | wc -l
+          sudo find linux-7.2-rc1 -type f | wc -l
 
       - name: Test ZFS operations
         run: |

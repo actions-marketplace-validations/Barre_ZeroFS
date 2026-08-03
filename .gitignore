@@ -4,3 +4,31 @@ target
 bench/bench_workspace
 zerofs.toml
 TODO.md
+__pycache__
+jepsen/ha/store
+jepsen/ha/.lein-failures
+
+# generated site assembled by scripts/build-site.sh
+/dist/site
+
+# Zola's default local build/serve output
+/website/public
+
+# out-of-tree kernel module build products
+/kernel/*.ko
+/kernel/*.mod
+/kernel/*.mod.c
+/kernel/*.o
+/kernel/.*.cmd
+/kernel/.*.o.d
+/kernel/netfs/*.o
+/kernel/netfs/.*.cmd
+/kernel/netfs/.*.o.d
+/kernel/vfs/*.o
+/kernel/vfs/.*.cmd
+/kernel/vfs/.*.o.d
+/kernel/Module.symvers
+/kernel/modules.order
+/kernel/fs_context_bindings.rs
+/kernel/netfs/bindings.rs
+/kernel/vfs/layout_bindings.rs

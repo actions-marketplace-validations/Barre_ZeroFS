@@ -1,0 +1,1026 @@
+//! Integration tests against a real zerofs server: a `zerofs run` child with
+//! file:// storage and unix sockets in a temp dir, the real CSI services
+//! served over a unix socket, and a real 9P client verifying what the
+//! controller did to the gateway filesystem. No mocks.
+
+use ninep_client::{NOFID, NinePClient};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::time::Duration;
+use tonic::Code;
+use tonic::transport::{Channel, Endpoint, Uri};
+use tower::service_fn;
+use zerofs_csi::controller::ControllerService;
+use zerofs_csi::identity::IdentityService;
+use zerofs_csi::node::{MountAccess, NodeService};
+use zerofs_csi::proto::csi::v1::controller_client::ControllerClient;
+use zerofs_csi::proto::csi::v1::identity_client::IdentityClient;
+use zerofs_csi::proto::csi::v1::node_client::NodeClient;
+use zerofs_csi::proto::csi::v1::{
+    CapacityRange, CreateVolumeRequest, DeleteVolumeRequest, GetPluginInfoRequest,
+    NodeGetVolumeStatsRequest, NodePublishVolumeRequest, NodeUnpublishVolumeRequest, ProbeRequest,
+    ValidateVolumeCapabilitiesRequest, VolumeCapability, controller_service_capability,
+    volume_capability,
+};
+use zerofs_csi::server::serve;
+
+/// Locate the zerofs binary built by this workspace, building it on demand
+/// when only the csi tests were compiled.
+fn zerofs_binary() -> PathBuf {
+    if let Ok(bin) = std::env::var("ZEROFS_BIN") {
+        return PathBuf::from(bin);
+    }
+    // target/debug/deps/integration-... -> target/debug/zerofs
+    let exe = std::env::current_exe().expect("current_exe");
+    let debug_dir = exe
+        .parent()
+        .and_then(Path::parent)
+        .expect("test executable outside target dir");
+    let candidate = debug_dir.join("zerofs");
+    if candidate.exists() {
+        return candidate;
+    }
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let status = Command::new(env!("CARGO"))
+        .args(["build", "-p", "zerofs", "--bin", "zerofs"])
+        .current_dir(workspace)
+        .status()
+        .expect("failed to run cargo build -p zerofs");
+    assert!(status.success(), "cargo build -p zerofs failed");
+    assert!(candidate.exists(), "zerofs binary missing after build");
+    candidate
+}
+
+/// A real zerofs server child process backed by file:// storage in a temp
+/// dir, exposing 9P and the admin RPC on unix sockets.
+struct TestServer {
+    child: Child,
+    dir: tempfile::TempDir,
+    ninep_sock: PathBuf,
+    rpc_sock: PathBuf,
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl TestServer {
+    /// 9P gateway address in the form `zerofs mount` and the node service
+    /// accept.
+    fn gateway(&self) -> String {
+        format!("unix:{}", self.ninep_sock.display())
+    }
+
+    /// Admin endpoint in the form the CSI controller accepts.
+    fn admin_endpoint(&self) -> String {
+        format!("unix://{}", self.rpc_sock.display())
+    }
+}
+
+async fn start_zerofs_server() -> TestServer {
+    let dir = tempfile::tempdir().unwrap();
+    let ninep_sock = dir.path().join("9p.sock");
+    let rpc_sock = dir.path().join("rpc.sock");
+    let config = format!(
+        r#"
+[cache]
+dir = "{cache}"
+disk_size_gb = 1.0
+
+[storage]
+url = "file://{data}"
+encryption_password = "csi-integration-test"
+
+[servers]
+
+[servers.ninep]
+unix_socket = "{ninep}"
+
+[servers.rpc]
+unix_socket = "{rpc}"
+
+[telemetry]
+enabled = false
+"#,
+        cache = dir.path().join("cache").display(),
+        data = dir.path().join("data").display(),
+        ninep = ninep_sock.display(),
+        rpc = rpc_sock.display(),
+    );
+    let config_path = dir.path().join("zerofs.toml");
+    std::fs::write(&config_path, config).unwrap();
+
+    // Quiet on success but real failures still reach the test output.
+    let child = Command::new(zerofs_binary())
+        .args(["run", "-c"])
+        .arg(&config_path)
+        .env("RUST_LOG", "warn")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("failed to spawn zerofs run");
+
+    let server = TestServer {
+        child,
+        dir,
+        ninep_sock,
+        rpc_sock,
+    };
+
+    // Wait until both sockets accept connections.
+    for sock in [&server.ninep_sock, &server.rpc_sock] {
+        let mut connected = false;
+        for _ in 0..600 {
+            if tokio::net::UnixStream::connect(sock).await.is_ok() {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(connected, "zerofs server never opened {:?}", sock);
+    }
+    server
+}
+
+/// Serve the real CSI services on a unix socket inside `dir` and return
+/// connected gRPC clients.
+async fn start_csi(
+    dir: &Path,
+) -> (
+    IdentityClient<Channel>,
+    ControllerClient<Channel>,
+    NodeClient<Channel>,
+) {
+    let csi_sock = dir.join("csi.sock");
+    let endpoint = format!("unix://{}", csi_sock.display());
+    let identity = IdentityService::new(true);
+    let controller = ControllerService::new();
+    // The production default (--access all) needs root or user_allow_other
+    // in /etc/fuse.conf; fall back to owner so the FUSE test still runs the
+    // real mount path on unprivileged dev machines.
+    let mount_access = if allow_other_permitted() {
+        MountAccess::All
+    } else {
+        MountAccess::Owner
+    };
+    let node = NodeService::new(
+        "test-node".to_string(),
+        zerofs_binary().display().to_string(),
+        mount_access,
+    );
+    tokio::spawn(async move {
+        serve(
+            &endpoint,
+            identity,
+            Some(controller),
+            Some(node),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut channel = None;
+    for _ in 0..100 {
+        let path = csi_sock.clone();
+        let result = Endpoint::try_from("http://localhost")
+            .unwrap()
+            .connect_with_connector(service_fn(move |_: Uri| {
+                let path = path.clone();
+                async move {
+                    let stream = tokio::net::UnixStream::connect(&path).await?;
+                    Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+                }
+            }))
+            .await;
+        match result {
+            Ok(c) => {
+                channel = Some(c);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    let channel = channel.expect("CSI server never came up");
+    (
+        IdentityClient::new(channel.clone()),
+        ControllerClient::new(channel.clone()),
+        NodeClient::new(channel),
+    )
+}
+
+fn mount_capability(mode: volume_capability::access_mode::Mode) -> VolumeCapability {
+    VolumeCapability {
+        access_type: Some(volume_capability::AccessType::Mount(
+            volume_capability::MountVolume::default(),
+        )),
+        access_mode: Some(volume_capability::AccessMode { mode: mode as i32 }),
+    }
+}
+
+fn block_capability() -> VolumeCapability {
+    VolumeCapability {
+        access_type: Some(volume_capability::AccessType::Block(
+            volume_capability::BlockVolume::default(),
+        )),
+        access_mode: Some(volume_capability::AccessMode {
+            mode: volume_capability::access_mode::Mode::SingleNodeWriter as i32,
+        }),
+    }
+}
+
+fn create_request(server: &TestServer, name: &str) -> CreateVolumeRequest {
+    CreateVolumeRequest {
+        name: name.to_string(),
+        capacity_range: Some(CapacityRange {
+            required_bytes: 1 << 30,
+            limit_bytes: 0,
+        }),
+        volume_capabilities: vec![mount_capability(
+            volume_capability::access_mode::Mode::SingleNodeWriter,
+        )],
+        parameters: HashMap::from([
+            ("adminEndpoint".to_string(), server.admin_endpoint()),
+            ("gateway".to_string(), server.gateway()),
+        ]),
+        ..Default::default()
+    }
+}
+
+fn delete_request(server: &TestServer, volume_id: &str) -> DeleteVolumeRequest {
+    DeleteVolumeRequest {
+        volume_id: volume_id.to_string(),
+        secrets: HashMap::from([("adminEndpoint".to_string(), server.admin_endpoint())]),
+    }
+}
+
+/// Attach a fresh 9P session rooted at `aname`. Success implies the
+/// directory exists on the gateway (a missing path fails the attach).
+/// Returns the client and the attached root fid.
+async fn attach_aname(
+    server: &TestServer,
+    aname: &str,
+) -> std::io::Result<(Arc<NinePClient>, u32)> {
+    let client = NinePClient::connect_unix(&server.ninep_sock, 256 * 1024).await?;
+    let fid = client.alloc_fid();
+    client
+        .attach(fid, NOFID, "root", aname, 0)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    Ok((client, fid))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_and_delete_volume_against_real_gateway() {
+    let server = start_zerofs_server().await;
+    let (mut identity, mut controller, _node) = start_csi(server.dir.path()).await;
+
+    // Identity sanity.
+    let info = identity
+        .get_plugin_info(GetPluginInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.name, "csi.zerofs.net");
+    assert!(!info.vendor_version.is_empty());
+    let probe = identity.probe(ProbeRequest {}).await.unwrap().into_inner();
+    assert_eq!(probe.ready, Some(true));
+    let caps = controller
+        .controller_get_capabilities(
+            zerofs_csi::proto::csi::v1::ControllerGetCapabilitiesRequest {},
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    let has_create_delete = caps.capabilities.iter().any(|c| {
+        matches!(
+            &c.r#type,
+            Some(controller_service_capability::Type::Rpc(rpc))
+                if rpc.r#type == controller_service_capability::rpc::Type::CreateDeleteVolume as i32
+        )
+    });
+    assert!(has_create_delete);
+
+    // CreateVolume provisions a directory on the gateway.
+    let volume = controller
+        .create_volume(create_request(&server, "pvc-itest"))
+        .await
+        .unwrap()
+        .into_inner()
+        .volume
+        .unwrap();
+    assert_eq!(volume.volume_id, "pvc-itest");
+    assert_eq!(volume.capacity_bytes, 1 << 30);
+    assert_eq!(
+        volume.volume_context.get("gateway"),
+        Some(&server.gateway())
+    );
+    assert_eq!(
+        volume.volume_context.get("volumesRoot"),
+        Some(&"/volumes".to_string())
+    );
+
+    // The directory is attachable as a 9P aname; a sibling that was never
+    // created is not.
+    attach_aname(&server, "/volumes/pvc-itest").await.unwrap();
+    assert!(attach_aname(&server, "/volumes/pvc-missing").await.is_err());
+
+    // Idempotent: same request again succeeds.
+    controller
+        .create_volume(create_request(&server, "pvc-itest"))
+        .await
+        .unwrap();
+
+    // Required-field and capability validation.
+    let status = controller
+        .create_volume(CreateVolumeRequest {
+            name: "pvc-bad".to_string(),
+            volume_capabilities: vec![block_capability()],
+            parameters: HashMap::from([
+                ("adminEndpoint".to_string(), server.admin_endpoint()),
+                ("gateway".to_string(), server.gateway()),
+            ]),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument);
+    let status = controller
+        .create_volume(CreateVolumeRequest {
+            name: "pvc-noparams".to_string(),
+            volume_capabilities: vec![mount_capability(
+                volume_capability::access_mode::Mode::SingleNodeWriter,
+            )],
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument);
+
+    // ValidateVolumeCapabilities confirms mount volumes and rejects block.
+    let confirmed = controller
+        .validate_volume_capabilities(ValidateVolumeCapabilitiesRequest {
+            volume_id: "pvc-itest".to_string(),
+            volume_capabilities: vec![mount_capability(
+                volume_capability::access_mode::Mode::MultiNodeMultiWriter,
+            )],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(confirmed.confirmed.is_some());
+    let rejected = controller
+        .validate_volume_capabilities(ValidateVolumeCapabilitiesRequest {
+            volume_id: "pvc-itest".to_string(),
+            volume_capabilities: vec![block_capability()],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(rejected.confirmed.is_none());
+    assert!(!rejected.message.is_empty());
+
+    // DeleteVolume removes the directory (the rename out of /volumes happens
+    // before the RPC returns; background deletion follows).
+    controller
+        .delete_volume(delete_request(&server, "pvc-itest"))
+        .await
+        .unwrap();
+    assert!(attach_aname(&server, "/volumes/pvc-itest").await.is_err());
+
+    // Idempotent: deleting again (or a volume that never existed) succeeds.
+    controller
+        .delete_volume(delete_request(&server, "pvc-itest"))
+        .await
+        .unwrap();
+    controller
+        .delete_volume(delete_request(&server, "pvc-never-existed"))
+        .await
+        .unwrap();
+
+    // Without the provisioner secret the controller cannot reach the
+    // gateway and must say so.
+    let status = controller
+        .delete_volume(DeleteVolumeRequest {
+            volume_id: "pvc-itest".to_string(),
+            secrets: HashMap::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument);
+}
+
+/// Whether `zerofs mount --access all` (FUSE allow_other) can work for this
+/// process: either we are root or /etc/fuse.conf enables user_allow_other.
+fn allow_other_permitted() -> bool {
+    if unsafe { libc::geteuid() } == 0 {
+        return true;
+    }
+    std::fs::read_to_string("/etc/fuse.conf")
+        .map(|conf| conf.lines().any(|l| l.trim() == "user_allow_other"))
+        .unwrap_or(false)
+}
+
+/// FUSE is required: needs /dev/fuse and a fusermount helper. Skips
+/// gracefully when unavailable (e.g. minimal CI containers).
+fn fuse_available() -> bool {
+    if !Path::new("/dev/fuse").exists() {
+        return false;
+    }
+    ["fusermount3", "fusermount"].iter().any(|bin| {
+        Command::new(bin)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn node_publish_and_unpublish_fuse_mount() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount not available");
+        return;
+    }
+
+    let server = start_zerofs_server().await;
+    let (_identity, mut controller, mut node) = start_csi(server.dir.path()).await;
+
+    controller
+        .create_volume(create_request(&server, "pvc-fuse"))
+        .await
+        .unwrap();
+
+    let target = server.dir.path().join("publish/target");
+    let publish_request = NodePublishVolumeRequest {
+        volume_id: "pvc-fuse".to_string(),
+        target_path: target.display().to_string(),
+        volume_capability: Some(mount_capability(
+            volume_capability::access_mode::Mode::SingleNodeWriter,
+        )),
+        volume_context: HashMap::from([("gateway".to_string(), server.gateway())]),
+        ..Default::default()
+    };
+    node.node_publish_volume(publish_request.clone())
+        .await
+        .unwrap();
+
+    // The mount is live: write through FUSE...
+    tokio::task::block_in_place(|| {
+        use std::io::Write;
+        let mut f = std::fs::File::create(target.join("hello.txt")).unwrap();
+        f.write_all(b"from fuse").unwrap();
+        f.sync_all().unwrap();
+    });
+
+    // ...and the file is visible on the gateway inside the volume subtree.
+    let (client, root_fid) = attach_aname(&server, "/volumes/pvc-fuse").await.unwrap();
+    client
+        .walk(root_fid, client.alloc_fid(), &[b"hello.txt".as_ref()])
+        .await
+        .unwrap();
+
+    // Publishing the same volume at the same target again is a no-op.
+    node.node_publish_volume(publish_request.clone())
+        .await
+        .unwrap();
+
+    // Stats come from statfs on the mountpoint.
+    let stats = node
+        .node_get_volume_stats(NodeGetVolumeStatsRequest {
+            volume_id: "pvc-fuse".to_string(),
+            volume_path: target.display().to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!stats.usage.is_empty());
+
+    // Kill the FUSE child (SIGKILL, no cleanup) to leave a broken mount:
+    // statfs on the target starts failing with ENOTCONN. Publishing again
+    // must lazily unmount the corpse and mount fresh.
+    let pgrep = Command::new("pgrep")
+        .args(["-f", &format!("zerofs mount .*{}", target.display())])
+        .output()
+        .unwrap();
+    let pid: i32 = String::from_utf8_lossy(&pgrep.stdout)
+        .trim()
+        .parse()
+        .expect("expected exactly one zerofs mount child");
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    let mut broken = false;
+    for _ in 0..100 {
+        if std::fs::metadata(&target)
+            .err()
+            .and_then(|e| e.raw_os_error())
+            == Some(libc::ENOTCONN)
+        {
+            broken = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(broken, "mount never went ENOTCONN after killing the child");
+    node.node_publish_volume(publish_request.clone())
+        .await
+        .unwrap();
+    let recovered =
+        tokio::task::block_in_place(|| std::fs::read(target.join("hello.txt"))).unwrap();
+    assert_eq!(recovered, b"from fuse");
+
+    // Unpublish unmounts and removes the target directory.
+    let unpublish_request = NodeUnpublishVolumeRequest {
+        volume_id: "pvc-fuse".to_string(),
+        target_path: target.display().to_string(),
+    };
+    node.node_unpublish_volume(unpublish_request.clone())
+        .await
+        .unwrap();
+    assert!(!target.exists());
+
+    // Idempotent: unpublishing again succeeds.
+    node.node_unpublish_volume(unpublish_request).await.unwrap();
+
+    controller
+        .delete_volume(delete_request(&server, "pvc-fuse"))
+        .await
+        .unwrap();
+}
+
+/// When the gateway is gone but the mount child is still alive (wedged behind
+/// its 9P reconnect loop), statfs on the mount blocks forever. The node plugin
+/// must detect the dead gateway with its cancellable probe and report the
+/// volume unavailable promptly, never parking on the syscall.
+#[tokio::test(flavor = "multi_thread")]
+async fn stats_and_republish_fail_fast_when_gateway_unreachable() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount not available");
+        return;
+    }
+
+    let mut server = start_zerofs_server().await;
+    let (_identity, mut controller, mut node) = start_csi(server.dir.path()).await;
+
+    controller
+        .create_volume(create_request(&server, "pvc-wedge"))
+        .await
+        .unwrap();
+
+    let target = server.dir.path().join("publish/wedge");
+    let publish_request = NodePublishVolumeRequest {
+        volume_id: "pvc-wedge".to_string(),
+        target_path: target.display().to_string(),
+        volume_capability: Some(mount_capability(
+            volume_capability::access_mode::Mode::SingleNodeWriter,
+        )),
+        volume_context: HashMap::from([("gateway".to_string(), server.gateway())]),
+        ..Default::default()
+    };
+    node.node_publish_volume(publish_request.clone())
+        .await
+        .unwrap();
+
+    // Kill the gateway, not the mount child: the child stays alive and enters
+    // its 9P reconnect loop, so any statfs on the mount blocks until a
+    // reconnect that never comes. (TestServer::drop kills it again, harmlessly.)
+    unsafe { libc::kill(server.child.id() as i32, libc::SIGKILL) };
+    let _ = server.child.wait();
+    // Wait until the 9P socket stops accepting, so the probe sees it as down.
+    for _ in 0..100 {
+        if tokio::net::UnixStream::connect(&server.ninep_sock)
+            .await
+            .is_err()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Stats must fail fast via the probe, not hang on statfs. A hang would take
+    // the 5s statfs deadline (or longer); the probe answers in well under that.
+    let start = std::time::Instant::now();
+    let err = node
+        .node_get_volume_stats(NodeGetVolumeStatsRequest {
+            volume_id: "pvc-wedge".to_string(),
+            volume_path: target.display().to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Unavailable, "{err}");
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "stats hung for {:?} instead of failing fast",
+        start.elapsed()
+    );
+
+    // Republishing the wedged mount likewise reports Unavailable promptly,
+    // leaving the mount in place to reconnect rather than remounting.
+    let start = std::time::Instant::now();
+    let err = node.node_publish_volume(publish_request).await.unwrap_err();
+    assert_eq!(err.code(), Code::Unavailable, "{err}");
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "publish hung for {:?} instead of failing fast",
+        start.elapsed()
+    );
+
+    // Unpublish still cleans up the wedged mount (lazy unmount + SIGTERM).
+    node.node_unpublish_volume(NodeUnpublishVolumeRequest {
+        volume_id: "pvc-wedge".to_string(),
+        target_path: target.display().to_string(),
+    })
+    .await
+    .unwrap();
+    assert!(!target.exists());
+}
+
+// HA (leader/standby) end-to-end: a real leader + standby pair over ONE
+// file:// store, with the CSI driver pointed at BOTH nodes (comma-separated
+// gateway / adminEndpoint). Proves the control plane reaches whichever node
+// leads and the data-plane mount follows the leader across a failover. These
+// spawn two processes and depend on failover timing, so they are #[ignore]'d
+// like the core failover_e2e suite and run explicitly with --ignored.
+
+/// Reserve a currently-free localhost TCP port for the replication endpoint.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_ha_config(
+    path: &Path,
+    data_dir: &Path,
+    cache_dir: &Path,
+    node_id: &str,
+    role: &str,
+    ninep_sock: &Path,
+    rpc_sock: &Path,
+    peers: Option<&str>,
+    replication_listen: Option<&str>,
+) {
+    let peers_line = match peers {
+        Some(p) => format!("peers = [\"{p}\"]\n"),
+        None => String::new(),
+    };
+    let listen_line = match replication_listen {
+        Some(l) => format!("replication_listen = \"{l}\"\n"),
+        None => String::new(),
+    };
+    let cfg = format!(
+        r#"
+[cache]
+dir = "{cache}"
+disk_size_gb = 1.0
+
+[storage]
+url = "file://{data}"
+encryption_password = "csi-ha-integration-test"
+
+[servers]
+
+[servers.ninep]
+unix_socket = "{ninep}"
+
+[servers.rpc]
+unix_socket = "{rpc}"
+
+[replication]
+node_id = "{node_id}"
+role = "{role}"
+{peers_line}{listen_line}
+[telemetry]
+enabled = false
+"#,
+        cache = cache_dir.display(),
+        data = data_dir.display(),
+        ninep = ninep_sock.display(),
+        rpc = rpc_sock.display(),
+    );
+    std::fs::write(path, cfg).unwrap();
+}
+
+fn spawn_node(config_path: &Path) -> Child {
+    // Silence the spawned servers by default (their stderr bypasses cargo's
+    // capture and SlateDB logs expected fencing errors on failover). Set
+    // ZEROFS_TEST_LOG to a RUST_LOG filter to surface them for debugging.
+    let log = std::env::var("ZEROFS_TEST_LOG").ok();
+    Command::new(zerofs_binary())
+        .args(["run", "-c"])
+        .arg(config_path)
+        .env("RUST_LOG", log.as_deref().unwrap_or("off"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(if log.is_some() {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
+        .spawn()
+        .expect("failed to spawn zerofs run")
+}
+
+async fn wait_for_unix_socket(sock: &Path, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if tokio::net::UnixStream::connect(sock).await.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// A real leader + standby pair over one file:// store. The leader ships to the
+/// standby's replication endpoint; the standby serves 9P/admin only after it
+/// takes over (so its unix sockets appear on failover). Both child processes
+/// are killed on drop.
+struct HaPair {
+    dir: tempfile::TempDir,
+    leader: Option<Child>,
+    standby: Child,
+    l_9p: PathBuf,
+    l_rpc: PathBuf,
+    s_9p: PathBuf,
+    s_rpc: PathBuf,
+}
+
+impl Drop for HaPair {
+    fn drop(&mut self) {
+        if let Some(mut l) = self.leader.take() {
+            let _ = l.kill();
+            let _ = l.wait();
+        }
+        let _ = self.standby.kill();
+        let _ = self.standby.wait();
+    }
+}
+
+impl HaPair {
+    async fn start() -> HaPair {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let l_9p = dir.path().join("leader-9p.sock");
+        let l_rpc = dir.path().join("leader-rpc.sock");
+        let s_9p = dir.path().join("standby-9p.sock");
+        let s_rpc = dir.path().join("standby-rpc.sock");
+        let l_cfg = dir.path().join("leader.toml");
+        let s_cfg = dir.path().join("standby.toml");
+
+        // Leader ships to the standby's replication endpoint; standby receives
+        // there. Asymmetric (matching failover_e2e) is enough for one failover.
+        let standby_repl = format!("127.0.0.1:{}", free_port());
+        write_ha_config(
+            &l_cfg,
+            &data_dir,
+            &dir.path().join("cache-l"),
+            "node-leader",
+            "leader",
+            &l_9p,
+            &l_rpc,
+            Some(&standby_repl),
+            None,
+        );
+        write_ha_config(
+            &s_cfg,
+            &data_dir,
+            &dir.path().join("cache-s"),
+            "node-standby",
+            "standby",
+            &s_9p,
+            &s_rpc,
+            None,
+            Some(&standby_repl),
+        );
+
+        // Standby first so the leader's Hello finds it and shipping connects.
+        let standby = spawn_node(&s_cfg);
+        let leader = spawn_node(&l_cfg);
+        assert!(
+            wait_for_unix_socket(&l_9p, Duration::from_secs(90)).await,
+            "leader 9P never came up"
+        );
+        // Let the leader's replicator connect and the standby begin watching
+        // heartbeats before any test kills the leader.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        HaPair {
+            dir,
+            leader: Some(leader),
+            standby,
+            l_9p,
+            l_rpc,
+            s_9p,
+            s_rpc,
+        }
+    }
+
+    /// Both nodes' 9P addresses, the comma-separated form the node service and
+    /// `zerofs mount` accept.
+    fn gateways(&self) -> String {
+        format!("unix:{},unix:{}", self.l_9p.display(), self.s_9p.display())
+    }
+
+    /// Both nodes' admin endpoints, comma-separated for the controller.
+    fn admin_endpoints(&self) -> String {
+        format!(
+            "unix://{},unix://{}",
+            self.l_rpc.display(),
+            self.s_rpc.display()
+        )
+    }
+
+    fn kill_leader(&mut self) {
+        if let Some(mut l) = self.leader.take() {
+            l.kill().expect("kill leader");
+            l.wait().expect("reap leader");
+        }
+    }
+
+    /// Wait for the standby to take over: it binds its 9P (and admin) sockets
+    /// only once promoted.
+    async fn await_takeover(&self) {
+        assert!(
+            wait_for_unix_socket(&self.s_9p, Duration::from_secs(60)).await,
+            "standby never took over (9P socket never came up)"
+        );
+    }
+
+    fn create_request(&self, name: &str) -> CreateVolumeRequest {
+        CreateVolumeRequest {
+            name: name.to_string(),
+            volume_capabilities: vec![mount_capability(
+                volume_capability::access_mode::Mode::SingleNodeWriter,
+            )],
+            parameters: HashMap::from([
+                ("adminEndpoint".to_string(), self.admin_endpoints()),
+                ("gateway".to_string(), self.gateways()),
+            ]),
+            ..Default::default()
+        }
+    }
+
+    fn delete_request(&self, volume_id: &str) -> DeleteVolumeRequest {
+        DeleteVolumeRequest {
+            volume_id: volume_id.to_string(),
+            secrets: HashMap::from([("adminEndpoint".to_string(), self.admin_endpoints())]),
+        }
+    }
+}
+
+/// The controller provisions against whichever node leads: create against the
+/// leader, then after a failover create+delete must reach the promoted standby
+/// (the dead leader's admin endpoint is skipped). Exercises the admin
+/// multi-endpoint selection and the connect_multi existence probe; no FUSE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real-process HA e2e: spawns two nodes and depends on failover timing; run with --ignored"]
+async fn ha_controller_provisions_against_the_leader_across_failover() {
+    let mut ha = HaPair::start().await;
+    let (_identity, mut controller, _node) = start_csi(ha.dir.path()).await;
+
+    // Create against the pair: the admin call reaches the leader.
+    controller
+        .create_volume(ha.create_request("pvc-ha"))
+        .await
+        .unwrap();
+
+    // The existence probe follows the leader via connect_multi.
+    let confirmed = controller
+        .validate_volume_capabilities(ValidateVolumeCapabilitiesRequest {
+            volume_id: "pvc-ha".to_string(),
+            volume_capabilities: vec![mount_capability(
+                volume_capability::access_mode::Mode::SingleNodeWriter,
+            )],
+            volume_context: HashMap::from([("gateway".to_string(), ha.gateways())]),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(confirmed.confirmed.is_some());
+
+    // Fail the leader over; the standby promotes and starts serving admin/9P.
+    ha.kill_leader();
+    ha.await_takeover().await;
+    assert!(
+        wait_for_unix_socket(&ha.s_rpc, Duration::from_secs(60)).await,
+        "promoted node never opened its admin RPC"
+    );
+
+    // The controller skips the dead leader's admin endpoint and provisions
+    // against the promoted standby, for both create and delete.
+    controller
+        .create_volume(ha.create_request("pvc-ha-after"))
+        .await
+        .unwrap();
+    controller
+        .delete_volume(ha.delete_request("pvc-ha"))
+        .await
+        .unwrap();
+}
+
+/// A published FUSE mount points at both nodes and survives a leader failover
+/// with no remount: the file written (and fsync'd) before the failover is
+/// served by the promoted standby, and NodeGetVolumeStats sees the standby as
+/// the reachable gateway. Exercises the multi-target mount and gateway probe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real-process HA e2e: spawns two nodes and depends on failover timing; run with --ignored"]
+async fn ha_published_mount_survives_failover() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount not available");
+        return;
+    }
+
+    let mut ha = HaPair::start().await;
+    let (_identity, mut controller, mut node) = start_csi(ha.dir.path()).await;
+
+    controller
+        .create_volume(ha.create_request("pvc-ha-fuse"))
+        .await
+        .unwrap();
+
+    let target = ha.dir.path().join("publish/ha");
+    let publish_request = NodePublishVolumeRequest {
+        volume_id: "pvc-ha-fuse".to_string(),
+        target_path: target.display().to_string(),
+        volume_capability: Some(mount_capability(
+            volume_capability::access_mode::Mode::SingleNodeWriter,
+        )),
+        volume_context: HashMap::from([("gateway".to_string(), ha.gateways())]),
+        ..Default::default()
+    };
+    node.node_publish_volume(publish_request).await.unwrap();
+
+    // Write and fsync through the mount so the payload is durable on the shared
+    // store before the failover.
+    tokio::task::block_in_place(|| {
+        use std::io::Write;
+        let mut f = std::fs::File::create(target.join("ha.txt")).unwrap();
+        f.write_all(b"survives failover").unwrap();
+        f.sync_all().unwrap();
+    });
+
+    // Fail the leader over. The mount's 9P client re-probes both targets and
+    // follows the promoted standby; the read blocks through the gap and then
+    // returns the committed payload.
+    ha.kill_leader();
+    ha.await_takeover().await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut recovered = None;
+    while std::time::Instant::now() < deadline {
+        match tokio::task::block_in_place(|| std::fs::read(target.join("ha.txt"))) {
+            Ok(data) => {
+                recovered = Some(data);
+                break;
+            }
+            // The mount is mid-reconnect: retry until it follows the new leader.
+            Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+        }
+    }
+    assert_eq!(
+        recovered.as_deref(),
+        Some(&b"survives failover"[..]),
+        "the pre-failover write must be served by the promoted standby"
+    );
+
+    // Stats: the tracked gateway list now has the standby reachable, so the
+    // probe passes and statfs answers (proves multi-target gateway_reachable).
+    let stats = node
+        .node_get_volume_stats(NodeGetVolumeStatsRequest {
+            volume_id: "pvc-ha-fuse".to_string(),
+            volume_path: target.display().to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!stats.usage.is_empty());
+
+    node.node_unpublish_volume(NodeUnpublishVolumeRequest {
+        volume_id: "pvc-ha-fuse".to_string(),
+        target_path: target.display().to_string(),
+    })
+    .await
+    .unwrap();
+    controller
+        .delete_volume(ha.delete_request("pvc-ha-fuse"))
+        .await
+        .unwrap();
+}

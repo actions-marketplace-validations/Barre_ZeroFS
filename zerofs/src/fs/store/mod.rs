@@ -1,9 +1,13 @@
-pub mod chunk;
 pub mod directory;
+pub mod extent;
 pub mod inode;
+pub mod orphan;
+mod read_cache;
 pub mod tombstone;
 
-pub use chunk::ChunkStore;
 pub use directory::DirectoryStore;
+pub(crate) use extent::QUIESCENT_AFTER_DEFAULT;
+pub use extent::{ChainOutcome, ExtentStore, PassOutcome, PassStatus};
 pub use inode::InodeStore;
+pub use orphan::OrphanStore;
 pub use tombstone::TombstoneStore;

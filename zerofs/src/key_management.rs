@@ -10,7 +10,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
 };
 use object_store::path::Path;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use rand::{RngCore, thread_rng};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -164,7 +164,7 @@ impl KeyManager {
 /// Get the path for the wrapped key file in object store
 fn wrapped_key_path(db_path: &Path) -> Path {
     let mut path = db_path.clone();
-    path = path.child(WRAPPED_KEY_FILENAME);
+    path = path.join(WRAPPED_KEY_FILENAME);
     path
 }
 
@@ -217,37 +217,72 @@ pub async fn load_or_init_encryption_key(
     password: &str,
     read_only: bool,
 ) -> Result<[u8; 32]> {
-    let key_manager = KeyManager::new();
+    if let Some(wrapped_key) = load_wrapped_key_from_object_store(object_store, db_path).await? {
+        return unwrap_key_blocking(password, wrapped_key).await;
+    }
 
-    let existing_key = load_wrapped_key_from_object_store(object_store, db_path).await?;
+    if read_only {
+        return Err(anyhow::anyhow!(
+            "Cannot initialize encryption key in read-only mode. Please initialize the database in read-write mode first."
+        ));
+    }
 
-    match existing_key {
-        Some(wrapped_key) => {
-            let password = password.to_string();
-            spawn_blocking_named("argon2-unwrap", move || {
-                key_manager.unwrap_key(&password, &wrapped_key)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
-        }
-        None => {
-            if read_only {
-                return Err(anyhow::anyhow!(
-                    "Cannot initialize encryption key in read-only mode. Please initialize the database in read-write mode first."
-                ));
-            }
+    // No key yet: generate a candidate, but commit it with a conditional create so
+    // only ONE concurrent initializer wins. Nodes sharing a store MUST share one key
+    // (else blocks written by one node can't be decrypted by the other); if we lose
+    // the race, adopt the winner's key instead of keeping our own.
+    let pw = password.to_string();
+    let (wrapped_key, dek) = spawn_blocking_named("argon2-generate", move || {
+        KeyManager::new().generate_and_wrap_key(&pw)
+    })
+    .map_err(|e| anyhow::anyhow!("Failed to spawn task: {}", e))?
+    .await
+    .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
 
-            let password = password.to_string();
-            let (wrapped_key, dek) = spawn_blocking_named("argon2-generate", move || {
-                key_manager.generate_and_wrap_key(&password)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
+    if save_wrapped_key_if_absent(object_store, db_path, &wrapped_key).await? {
+        return Ok(dek);
+    }
 
-            save_wrapped_key_to_object_store(object_store, db_path, &wrapped_key).await?;
+    // Lost the init race: another node wrote its key first. Load and use it so every
+    // node that shares this store converges on a single key.
+    let wrapped_key = load_wrapped_key_from_object_store(object_store, db_path)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("wrapped key disappeared right after a concurrent init"))?;
+    unwrap_key_blocking(password, wrapped_key).await
+}
 
-            Ok(dek)
-        }
+/// Unwrap a wrapped DEK off the runtime (argon2 is CPU-heavy).
+async fn unwrap_key_blocking(password: &str, wrapped_key: WrappedDataKey) -> Result<[u8; 32]> {
+    let password = password.to_string();
+    spawn_blocking_named("argon2-unwrap", move || {
+        KeyManager::new().unwrap_key(&password, &wrapped_key)
+    })
+    .map_err(|e| anyhow::anyhow!("Failed to spawn task: {}", e))?
+    .await
+    .map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
+}
+
+/// Persist the wrapped key only if absent (atomic create). Ok(true) = we wrote it,
+/// Ok(false) = another node beat us to it (so the caller must adopt that key).
+async fn save_wrapped_key_if_absent(
+    object_store: &Arc<dyn ObjectStore>,
+    db_path: &Path,
+    wrapped_key: &WrappedDataKey,
+) -> Result<bool> {
+    let key_path = wrapped_key_path(db_path);
+    let serialized = bincode::serialize(wrapped_key)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize wrapped key: {}", e))?;
+    match object_store
+        .put_opts(
+            &key_path,
+            PutPayload::from(Bytes::from(serialized)),
+            PutOptions::from(PutMode::Create),
+        )
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
+        Err(e) => Err(anyhow::anyhow!("Failed to save wrapped key: {}", e)),
     }
 }
 
@@ -269,6 +304,7 @@ pub async fn change_encryption_password(
     let new_wrapped_key = spawn_blocking_named("argon2-rewrap", move || {
         key_manager.rewrap_key(&old_password, &new_password, &wrapped_key)
     })
+    .map_err(|e| anyhow::anyhow!("Failed to spawn task: {}", e))?
     .await
     .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
 
@@ -345,5 +381,129 @@ mod tests {
             .expect("Failed to unwrap with new password");
 
         assert_eq!(original_dek, unwrapped_dek);
+    }
+
+    /// Two nodes initializing the same store concurrently must converge on ONE key.
+    /// Before the conditional-create init they each generated + kept their own key,
+    /// so blocks one wrote couldn't be decrypted by the other.
+    #[tokio::test]
+    async fn concurrent_init_converges_on_one_key() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let db_path = Path::from("data");
+        let pw = "shared-cluster-password";
+
+        let (ka, kb) = tokio::join!(
+            load_or_init_encryption_key(&store, &db_path, pw, false),
+            load_or_init_encryption_key(&store, &db_path, pw, false),
+        );
+        let ka = ka.expect("node A init");
+        let kb = kb.expect("node B init");
+        assert_eq!(ka, kb, "concurrent initializers must converge on one key");
+
+        // A later loader gets that same committed key.
+        let kc = load_or_init_encryption_key(&store, &db_path, pw, false)
+            .await
+            .expect("later load");
+        assert_eq!(ka, kc, "a later load must return the committed key");
+    }
+
+    fn store() -> Arc<dyn ObjectStore> {
+        Arc::new(object_store::memory::InMemory::new())
+    }
+
+    // Password rotation must preserve the DEK (data stays decryptable) and the old
+    // password must stop working.
+    #[tokio::test]
+    async fn change_password_rotates_without_losing_the_dek() {
+        let store = store();
+        let db_path = Path::from("data");
+        let (old_pw, new_pw) = ("old-pw-123", "new-pw-456");
+
+        let dek = load_or_init_encryption_key(&store, &db_path, old_pw, false)
+            .await
+            .unwrap();
+
+        change_encryption_password(&store, &db_path, old_pw, new_pw)
+            .await
+            .unwrap();
+
+        assert!(
+            load_or_init_encryption_key(&store, &db_path, old_pw, false)
+                .await
+                .is_err(),
+            "the old password must stop unwrapping the key"
+        );
+        let dek2 = load_or_init_encryption_key(&store, &db_path, new_pw, false)
+            .await
+            .unwrap();
+        assert_eq!(dek, dek2, "rotation must preserve the data key");
+    }
+
+    #[tokio::test]
+    async fn change_password_without_a_key_errors() {
+        let store = store();
+        assert!(
+            change_encryption_password(&store, &Path::from("data"), "a", "b")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_init_without_a_key_errors() {
+        let store = store();
+        let err = load_or_init_encryption_key(&store, &Path::from("data"), "pw", true)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("read-only"), "got: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn reload_with_wrong_password_errors() {
+        let store = store();
+        let db_path = Path::from("data");
+        load_or_init_encryption_key(&store, &db_path, "right", false)
+            .await
+            .unwrap();
+        assert!(
+            load_or_init_encryption_key(&store, &db_path, "wrong", false)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn load_wrapped_key_rejects_corrupt_bytes() {
+        let store = store();
+        let db_path = Path::from("data");
+        store
+            .put(
+                &db_path.clone().join(WRAPPED_KEY_FILENAME),
+                PutPayload::from(Bytes::from_static(b"not a bincode wrapped key")),
+            )
+            .await
+            .unwrap();
+        assert!(
+            load_wrapped_key_from_object_store(&store, &db_path)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn unwrap_rejects_an_unsupported_version() {
+        let km = KeyManager::new();
+        let (mut wrapped, _) = km.generate_and_wrap_key("pw").unwrap();
+        wrapped.version = 2;
+        let err = km.unwrap_key("pw", &wrapped).unwrap_err();
+        assert!(format!("{err:#}").contains("version"), "got: {err:#}");
+    }
+
+    #[test]
+    fn unwrap_rejects_a_corrupt_salt() {
+        let km = KeyManager::new();
+        let (mut wrapped, _) = km.generate_and_wrap_key("pw").unwrap();
+        wrapped.salt = "###not-valid-b64###".to_string();
+        assert!(km.unwrap_key("pw", &wrapped).is_err());
     }
 }

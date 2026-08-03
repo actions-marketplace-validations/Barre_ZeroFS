@@ -1,0 +1,298 @@
+import { Mermaid } from '@/components/Mermaid'
+
+export const metadata = {
+  title: 'High Availability',
+  description:
+    'Run ZeroFS as a two-node leader/standby pair with semi-synchronous replication, automatic failover, and writer-epoch fencing.',
+}
+
+export const sections = [
+  { title: 'Model', id: 'model' },
+  { title: 'Write path', id: 'write-path' },
+  { title: 'Authority and fencing', id: 'authority' },
+  { title: 'Failover', id: 'failover' },
+  { title: 'Durability', id: 'durability' },
+  { title: 'Configuration', id: 'configuration' },
+  { title: 'Clients and bindings', id: 'clients' },
+  { title: 'Kubernetes (CSI)', id: 'kubernetes' },
+  { title: 'Operations and limits', id: 'operations' },
+]
+
+# High Availability
+
+ZeroFS high availability runs two nodes over one object store. One node serves as leader while the other retains its unflushed write tail and is ready to take over. While the pair is connected, a single-node failure preserves acknowledged writes, including writes that have not yet been `fsync`'d. {{ className: 'lead' }}
+
+## Model {{ id: 'model' }}
+
+ZeroFS batches metadata and file data before uploading it to object storage. This keeps object-store latency and request cost off the write path, but leaves recent writes in memory until `fsync` or the next background flush. HA adds a second in-memory copy and another process that can reopen the same database.
+
+<Mermaid
+  chart={`
+flowchart TB
+    C["9P clients and client libraries<br/>configured with both targets"]
+    subgraph Pair["ZeroFS HA pair"]
+        L["Leader<br/>serves requests and owns the writer"]
+        S["Standby<br/>retains the replicated tail"]
+    end
+    O["Shared object storage<br/>manifest, SSTs, and immutable segments"]
+
+    C -->|"reads and writes"| L
+    C -.->|"reconnect after takeover"| S
+    L -->|"batches, frames, and heartbeats"| S
+    L -->|"flush and fsync"| O
+    S -.->|"claim, open, and reconcile"| O
+`}
+/>
+
+The pair has two operating modes:
+
+- **Connected:** the leader ships each mutation before applying it locally and replying to the client. The standby retains a complete ordered tail.
+- **Solo:** the leader cannot ship to the standby but keeps serving. This favors availability; writes return to the same durability window as a standalone node until replication recovers.
+
+The topology is always two HA participants and one data-database writer. It provides failover, not write scale-out.
+
+## Write path {{ id: 'write-path' }}
+
+<Mermaid
+  chart={`
+sequenceDiagram
+    participant C as Client
+    participant L as Leader
+    participant S as Standby
+    participant O as Object storage
+
+    C->>L: mutation
+    alt Connected
+        L->>S: ship sequence N and any sealed frame bytes
+        S->>S: validate complete prefix and retain tail
+        S-->>L: accepted
+        L->>L: apply sequence N locally
+        L-->>C: result
+    else Solo
+        L->>O: mark lineage non-inheritable before first Solo ack
+        L->>L: apply locally
+        L-->>C: result
+    end
+`}
+/>
+
+**Commit before apply.** In Connected mode, the standby accepts sequence _N_ only if durable storage and its retained tail cover every earlier sequence. The leader applies the mutation locally only after that acceptance. If a restarted receiver has lost part of its in-memory base, it rejects the suffix; the leader flushes the missing base and retries the same sequence.
+
+**Exact mutation results.** The replication batch includes the operation-result ledger used by the private `9P2000.L.Z` dialect. A request retried after disconnect keeps its operation id and original writer epoch, so a direct successor can return the recorded result instead of applying the mutation twice. Automatic retries stop after the 120-second protocol horizon if the outcome remains ambiguous.
+
+**File data ships as frames.** Metadata points into immutable segment objects. Until a segment is uploaded, the leader sends the compressed, encrypted frame bytes with the pointer. During takeover the standby materializes any missing segment at the original offsets before serving. Once a segment is durable, the pointer is sufficient because both nodes use the same object store.
+
+The standby prunes tail entries as leader flushes make them durable. Promotion is refused if the retained tail does not cover a complete prefix of the leader's applied state.
+
+## Authority and fencing {{ id: 'authority' }}
+
+The durable `.zerofs_ha_leader` marker serializes startup and handoff. Each transition uses the exact object version returned by the object store.
+
+<Mermaid
+  chart={`
+flowchart LR
+    A["Active<br/>serving owner"]
+    C["Claiming<br/>ACKs quiesced"]
+    O["Opening<br/>writer not yet serving"]
+    N["Active<br/>new generation"]
+    R["Replacement claim<br/>new generation and incarnation"]
+
+    A -->|"exact CAS"| C
+    C -->|"full 9 s grace"| O
+    O -->|"open writer, bump epoch,<br/>reconcile, exact CAS"| N
+    C -.->|"exact record unchanged for 5 s"| R
+    O -.->|"exact record unchanged for 5 s"| R
+    R --> C
+`}
+/>
+
+Safety has three separate layers:
+
+| Layer | Purpose |
+| --- | --- |
+| Marker ownership | Orders `Active → Claiming → Opening → Active` and prevents two candidates from completing the same handoff. In-progress records renew once per second. |
+| Serving authority | Gates successful 9P, WebSocket, and admin responses. Fresh heartbeat acknowledgements are the healthy fast path; exact marker validation is the degraded path. |
+| Writer epoch | A conditional manifest update performed when a writer opens. A higher epoch fences an older writer from committing durable database state. |
+
+Writer-epoch fencing is the final storage-safety boundary and does not depend on clocks. The marker and bounded serving lease prevent a deposed process from continuing to return successful responses while the successor opens.
+
+Failover, client recovery, and mutation retry use one static timing policy. These values are release policy, not configuration knobs, and do not change in response to observed latency. Durations that exist to cover other phases are derived rather than repeated as independent constants.
+
+| Event | Default |
+| --- | ---: |
+| Coverage heartbeat | 100 ms |
+| Heartbeat ACK considered fresh | 300 ms |
+| Takeover suspicion window | 2 s |
+| Serving-authority grant | 3 s |
+| Degraded marker validation cadence | every 1 s |
+| Ordinary marker validation attempt | up to 3 s |
+| Final marker recovery attempt | up to 3 s |
+| Response drain after authority loss | up to 2 s |
+| `Claiming` grace before `Opening` | 9 s |
+| Abandoned handoff observation | 5 s |
+
+The short windows cover the work expected during each phase. An ACK stays fresh for three heartbeat periods, and an abandoned handoff is observed for five renewal periods. The 9-second claim grace allows 3 seconds for existing authority, 3 seconds for final recovery, 2 seconds to drain responses, and 1 second of scheduling margin.
+
+Client recovery uses separate limits. Connection liveness checks can take up to 64 seconds. Session replay has no overall deadline; only its individual wire exchanges are timed. This lets large fid tables finish and lets lock replay wait through conflicts with capped backoff. A dispatched mutation may be retried for 120 seconds, while its recorded result remains available for 150 seconds. Replay can continue after the original request returns a disconnect error.
+
+An authority grant is measured from the validation request's start, so storage latency consumes the grant rather than extending it. Fresh exact-epoch heartbeat ACKs suppress marker reads. Once ACKs are stale, the leader validates its exact `Active` identity immediately and schedules each subsequent read from the one-second cadence. A read may take up to three seconds; the cadence no longer doubles as its timeout. If authority expires first, successful responses remain suspended during one final bounded validation; mismatch, timeout, error, or writer fencing retires the process.
+
+The proof does not require synchronized host clocks. Suspending a host or restoring a whole-process or VM snapshot is outside the strict no-overlap guarantee; fence or destroy the old host before another node opens the database.
+
+## Failover {{ id: 'failover' }}
+
+<Mermaid
+  chart={`
+sequenceDiagram
+    participant C as Client
+    participant L as Old leader
+    participant S as Standby
+    participant O as Object storage
+
+    Note over L: crash, partition, or authority loss
+    S->>S: heartbeat coverage absent for 2 s
+    S->>S: stop admitting heartbeat ACKs
+    S->>O: exact CAS Active to Claiming
+    Note over S,O: wait the full 9 s claim grace
+    S->>O: exact CAS Claiming to Opening
+    S->>O: open writer and publish a higher epoch
+    S->>S: validate and replay retained tail
+    S->>O: exact CAS Opening to Active
+    S->>O: validate exact Active identity
+    C->>S: reconnect and replay session
+`}
+/>
+
+Heartbeat silence is only a reason to attempt takeover; it grants no authority. A failed marker compare-and-swap leaves the standby non-serving. The nine-second claim grace covers the predecessor's last cached authority, final recovery attempt, response drain, and scheduling margin. Opening the writer then fences the previous epoch before the new leader serves.
+
+A node that restarts asks its peer for the live role instead of trusting the configured `role`. A live `Claiming` or `Opening` owner renews its exact record. If it dies mid-handoff, another eligible participant must observe the same record contents and physical object version unchanged for five seconds, install a new claim, and wait a new full grace period.
+
+Clients configured with both targets block through the gap, reconnect to the new leader, and rebuild their session. Crash failover therefore includes roughly the two-second suspicion window, the nine-second grace, writer open, tail reconciliation, and client reconnect; it is not instant.
+
+## Durability {{ id: 'durability' }}
+
+| State when a write is acknowledged | Survives | Remaining risk |
+| --- | --- | --- |
+| Connected, not yet `fsync`'d | Loss of either node | Both nodes fail before flush, or the standby loses its complete tail before recovery |
+| Solo, not yet `fsync`'d | A process restart only if the write was flushed first | Leader loss before flush; the standby never received the write |
+| Successful `fsync` | Node failure and HA takeover | Depends on the configured object store's durability |
+| `ignore_fsync = true` | Same as the current Connected or Solo row | `fsync` supplies no object-store barrier or lineage check |
+
+ZeroFS uses a lineage token to prevent false `fsync` success after recovery.
+
+<Mermaid
+  chart={`
+flowchart TD
+    T["Client has unfsynced work under token T"]
+    P{"Can takeover prove it inherited<br/>the complete write lineage?"}
+    K["Replay tail and keep token T"]
+    G["Generate token T2"]
+    OK["fsync(T): flush, verify T, return success"]
+    STALE["fsync(T): return ESTALE"]
+
+    T --> P
+    P -->|"yes: complete connected tail"| K
+    P -->|"no: Solo gap or cold loss"| G
+    K --> OK
+    G --> STALE
+`}
+/>
+
+Before acknowledging its first Solo write, a leader marks the current lineage non-inheritable in object storage. A successor that cannot prove it received the complete lineage generates a new token. A client presenting the old token then receives `ESTALE`, which reports that its un-`fsync`'d work did not survive; it is not a transient retry signal.
+
+Lineage verification follows the descriptor responsible under POSIX. `fsync` on a file covers that file's data and metadata across its open handles; directory-entry changes are covered by `fsync` on the directory. See [Durability and Consistency](/durability) for the full flush model.
+
+## Configuration {{ id: 'configuration' }}
+
+Both nodes must use the same storage URL, prefix, encryption password, and object-store credentials. Give each node a stable unique `node_id`, a local cache, and both sides of the replication connection.
+
+```toml
+# node-a
+[replication]
+node_id = "node-a"
+role = "leader"
+replication_listen = "10.0.0.1:9000"
+peers = ["10.0.0.2:9000"]
+```
+
+```toml
+# node-b
+[replication]
+node_id = "node-b"
+role = "standby"
+replication_listen = "10.0.0.2:9000"
+peers = ["10.0.0.1:9000"]
+```
+
+`role` is a bootstrap hint, not a permanent assignment. Configure both `replication_listen` and `peers` on both nodes so either can receive replication after a role swap. During normal operation, ZeroFS rejects a one-sided configuration instead of accepting a pair that cannot complete the reverse role swap. The forced-recovery procedure below is the explicit exception.
+
+The storage backend must support exact conditional object updates, either natively or through the configured conditional-write adapter. The replication and client ports are unauthenticated; keep them on a trusted network. `node_id`, `replication_listen`, and `peers` support the same `${VAR}` substitution as the rest of the configuration.
+
+### Forced recovery
+
+`force_recovery` bypasses normal stale-handoff observation. It is a break-glass assertion that all former participants are dead and their object-store requests are quiesced. A replacement node cannot distinguish this condition from a network partition or a suspended process. The unreachable process may still hold the only copy of acknowledged writes in its in-memory tail or resume a writer-open request. Normal failover is automatic only when a surviving standby can prove complete coverage. Without that proof, takeover requires an operator who has fenced every former participant.
+
+```toml
+[replication]
+node_id = "node-a"
+role = "leader"
+replication_listen = "10.0.0.1:9000"
+peers = []
+force_recovery = true
+```
+
+Within the handoff state machine, the flag skips only the five-second unchanged-record observation for an abandoned `Claiming` or `Opening` owner. It does not skip the nine-second `Claiming` grace, writer-epoch fencing, tail reconciliation, or the exact `Opening`-to-`Active` transition.
+
+<Warning>
+Do not force recovery against a live or partitioned peer. It can discard an acknowledged tail held only by that process and fence its database writer. If the peer died during `Opening`, also ensure its object-store requests are quiesced. Remove `force_recovery` after the recovery startup succeeds.
+</Warning>
+
+Upgrade the two HA peers together. New releases understand the legacy leader marker, but old releases cannot participate after the phased marker has been written, and the replication handshake is release-coupled.
+
+## Clients and bindings {{ id: 'clients' }}
+
+Pass both 9P addresses as one target set. The bundled mount and foreign-language bindings use a comma-separated string; Rust also exposes `connect_multi`. These userspace clients probe targets concurrently. The native kernel client tries its configured targets sequentially.
+
+| Client | HA connection |
+| --- | --- |
+| Native kernel client | `sudo mount -t zerofs 10.0.0.10:5564,10.0.0.11:5564 /mnt/zerofs` |
+| `zerofs mount` | `zerofs mount node-a:5564,node-b:5564 /mnt/zerofs` |
+| Rust | `Client::connect_multi(&["node-a:5564".into(), "node-b:5564".into()]).await?` |
+| Python | `await zerofs_client.Client.connect("node-a:5564,node-b:5564")` |
+| TypeScript | `await Client.connect("node-a:5564,node-b:5564")` |
+| Go | `zerofs.ClientConnect("node-a:5564,node-b:5564")` |
+
+The client tries the targets until it finds the serving leader. Userspace clients keep undispatched calls blocked while reconnecting. The native client limits each request's reconnect wait with `reconnect_grace_ms`, which defaults to 120 seconds. After takeover, the client rebinds linked open files by inode ID and reacquires recorded byte-range locks before resuming I/O. Open files that cannot be rebound become stale.
+
+An open file whose final directory link has been removed cannot be recovered on a new connection. That handle becomes stale, while unrelated handles remain usable. Server lock state is not replicated, so a competing session may acquire a lock during the gap. If the stale handle held a recorded lock, the client stops reconnecting and subsequent operations fail.
+
+The [native kernel client](/kernel-client) accepts the two leader/standby addresses as IP literals or Unix sockets and uses the private reconnect protocol. Stock Linux v9fs takes one endpoint and does not reconnect. NFS and NBD connections also do not reroute between the two nodes. Use the native client, `zerofs mount`, a client library, CSI, or an external connection-routing layer when transparent client failover is required.
+
+## Kubernetes (CSI) {{ id: 'kubernetes' }}
+
+The [CSI driver](/kubernetes-csi) uses the same client behavior. Set both data-plane and admin endpoints on the StorageClass:
+
+```yaml
+parameters:
+  gateway: node-a.zerofs.svc:5564,node-b.zerofs.svc:5564
+  adminEndpoint: http://node-a.zerofs.svc:7000,http://node-b.zerofs.svc:7000
+```
+
+Each published volume runs `zerofs mount` against both gateways. The controller probes both admin endpoints and sends provisioning calls to the leader. Gate gateway pod readiness on the replication port, not 9P: the standby opens replication early but does not serve 9P until takeover.
+
+## Operations and limits {{ id: 'operations' }}
+
+- **Two participants only.** Never attach a third HA process to the database. Use [read replicas](/read-replicas) for independent read scaling.
+- **Object storage remains shared infrastructure.** Both nodes need the same database and conditional-update service. HA does not make an unavailable object store available.
+- **The standby tail is held in RAM.** If the receiver cannot keep up or loses coverage, the leader enters Solo or flushes the missing base before Connected acknowledgements resume. An uncovered standby refuses promotion.
+- **Failover pauses clients.** The suspicion window, claim grace, writer open, reconciliation, and reconnect all contribute to the gap.
+- **Advisory locks are not fencing.** The bundled client attempts to reacquire them, but ownership is not continuous across reconnect and the server does not persist the lock table.
+- **Host lifecycle matters.** Externally fence suspended, snapshotted, or partitioned hosts before replacing them.
+
+Use [Prometheus metrics](/prometheus) and logs from both nodes to watch replication mode, coverage, authority, and failover. The replication listener must remain reachable in both directions after a role swap.
+
+<div className="not-prose">
+  <Button href="/durability" variant="text" arrow="right">
+    Durability and consistency
+  </Button>
+</div>

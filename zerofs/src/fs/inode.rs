@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 
 pub type InodeId = u64;
 
+/// Device-number limits of Linux's 12/20-bit `new_encode_dev` split, which both
+/// the 9P `Stat.rdev` field and NFS `specdata` are read back through.
+pub const MAX_DEVICE_MAJOR: u32 = (1 << 12) - 1;
+pub const MAX_DEVICE_MINOR: u32 = (1 << 20) - 1;
+
 pub trait InodeAttrs {
     fn uid(&self) -> u32;
     fn gid(&self) -> u32;
@@ -247,6 +252,25 @@ pub enum Inode {
     Socket(SpecialInode),
     CharDevice(SpecialInode),
     BlockDevice(SpecialInode),
+}
+
+#[cfg(test)]
+pub(crate) fn test_file_inode(size: u64) -> Inode {
+    Inode::File(FileInode {
+        size,
+        mtime: 1,
+        mtime_nsec: 0,
+        ctime: 1,
+        ctime_nsec: 0,
+        atime: 1,
+        atime_nsec: 0,
+        mode: 0o644,
+        uid: 1000,
+        gid: 1000,
+        parent: Some(0),
+        name: Some(b"cached".to_vec()),
+        nlink: 1,
+    })
 }
 
 impl InodeAttrs for Inode {

@@ -35,6 +35,16 @@ pub enum FsError {
     InvalidData,
     #[error("Read-only file system")]
     ReadOnlyFilesystem,
+    #[error("Leader lease expired (not the current leader)")]
+    LeaderLeaseExpired,
+    /// The current mutation batch was authoritatively rejected by a newer
+    /// writer before either the peer or this process applied it. 9P can expose
+    /// this narrower fact as a clean failover hint; other protocols treat it as
+    /// an ordinary I/O failure.
+    #[error("Leader rejected before applying the operation")]
+    LeaderRejectedBeforeApply,
+    #[error("Server shutting down")]
+    ShuttingDown,
 }
 
 impl From<bincode::Error> for FsError {
@@ -62,6 +72,9 @@ impl From<FsError> for nfsstat3 {
             FsError::StaleHandle => nfsstat3::NFS3ERR_STALE,
             FsError::InvalidData => nfsstat3::NFS3ERR_IO,
             FsError::ReadOnlyFilesystem => nfsstat3::NFS3ERR_ROFS,
+            FsError::LeaderLeaseExpired => nfsstat3::NFS3ERR_IO,
+            FsError::LeaderRejectedBeforeApply => nfsstat3::NFS3ERR_IO,
+            FsError::ShuttingDown => nfsstat3::NFS3ERR_IO,
         }
     }
 }
@@ -89,6 +102,16 @@ impl From<nfsstat3> for FsError {
 }
 
 impl FsError {
+    /// Preserve filesystem errors carried through `anyhow` by the database
+    /// wrapper. Unknown storage failures remain ordinary I/O errors.
+    pub(crate) fn from_db_error(error: &anyhow::Error) -> Self {
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<Self>())
+            .copied()
+            .unwrap_or(Self::IoError)
+    }
+
     pub fn to_errno(self) -> u32 {
         match self {
             FsError::PermissionDenied => libc::EACCES as u32,
@@ -107,6 +130,29 @@ impl FsError {
             FsError::StaleHandle => libc::ESTALE as u32,
             FsError::InvalidData => libc::EIO as u32,
             FsError::ReadOnlyFilesystem => libc::EROFS as u32,
+            // A distinct signal (not EIO) so a failover-aware 9P client re-probes
+            // the node set for the current leader and resends, instead of failing.
+            FsError::LeaderLeaseExpired => ninep_proto::P9_ENOTLEADER,
+            // The private CLEAN failover signal is selected only by the 9P
+            // handler, which can also preserve FIRST/RETRY semantics. Other
+            // errno consumers must see an ordinary I/O failure.
+            FsError::LeaderRejectedBeforeApply => libc::EIO as u32,
+            FsError::ShuttingDown => ninep_proto::P9_ENOTLEADER,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn database_error_mapping_preserves_filesystem_errors_through_context() {
+        let error = anyhow::Error::new(FsError::LeaderLeaseExpired).context("point read failed");
+        assert_eq!(FsError::from_db_error(&error), FsError::LeaderLeaseExpired);
+        assert_eq!(
+            FsError::from_db_error(&anyhow::anyhow!("storage failed")),
+            FsError::IoError
+        );
     }
 }

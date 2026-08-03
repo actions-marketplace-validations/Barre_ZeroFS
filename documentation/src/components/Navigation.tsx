@@ -68,7 +68,7 @@ function NavLink({
         'flex justify-between gap-2 py-1 pr-3 text-sm transition',
         isAnchorLink ? 'pl-7' : 'pl-4',
         active
-          ? 'text-zinc-900 dark:text-white'
+          ? 'text-zinc-900 dark:text-zinc-100'
           : 'text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white',
       )}
     >
@@ -171,7 +171,7 @@ function NavigationGroup({
     <li className={clsx('relative mt-6', className)}>
       <motion.h2
         layout="position"
-        className="text-xs font-semibold text-zinc-900 dark:text-white"
+        className="text-xs font-semibold text-zinc-900 dark:text-zinc-100"
       >
         {group.title}
       </motion.h2>
@@ -240,30 +240,38 @@ export const navigation: Array<NavGroup> = [
       { title: 'Quickstart', href: '/quickstart' },
       { title: 'Durability & Consistency', href: '/durability' },
       { title: 'Architecture', href: '/architecture' },
+      {
+        title: 'Storage Engine: Segments and Extents',
+        href: '/storage-engine',
+      },
       { title: 'Encryption & Security', href: '/encryption' },
       { title: 'Configuration', href: '/configuration' },
+      { title: 'Caching', href: '/caching' },
       { title: 'Checkpoints', href: '/checkpoints' },
-      { title: 'Standalone Compactor', href: '/standalone-compactor' },
-      { title: 'Separate WAL Store', href: '/separate-wal' },
-      { title: 'Troubleshooting', href: '/troubleshooting' },
-      { title: 'Advanced Use Cases', href: '/advanced-use-cases' },
-    ],
-  },
-  {
-    title: 'Benchmarks',
-    links: [
-      { title: 'ZeroFS vs AWS EFS', href: '/zerofs-vs-aws-efs' },
-      { title: 'ZeroFS vs Azure Files', href: '/zerofs-vs-azure-files' },
-      { title: 'ZeroFS vs JuiceFS', href: '/zerofs-vs-juicefs' },
-      { title: 'ZeroFS vs AWS Mountpoint-s3', href: '/zerofs-vs-mountpoint-s3' },
+      { title: 'Read Replicas', href: '/read-replicas' },
+      { title: 'High Availability', href: '/high-availability' },
+      { title: 'Garbage Collection', href: '/garbage-collection' },
+      {
+        title: 'Read-Directed Compaction',
+        href: '/read-directed-compaction',
+      },
+      { title: 'Monitoring & Tracing', href: '/monitoring' },
+      { title: 'Prometheus Metrics', href: '/prometheus' },
+      { title: 'Telemetry', href: '/telemetry' },
     ],
   },
   {
     title: 'Resources',
     links: [
+      { title: 'Web UI', href: '/web-ui' },
+      { title: 'PostgreSQL in the Browser', href: '/postgresql-in-the-browser' },
       { title: 'NFS File Access', href: '/nfs-access' },
+      { title: 'Native Kernel Client', href: '/kernel-client' },
       { title: '9P File Access', href: '/9p-access' },
+      { title: '9P Protocol Extensions', href: '/9p-extensions' },
+      { title: 'Client Libraries', href: '/client-libraries' },
       { title: 'NBD Block Devices', href: '/nbd-devices' },
+      { title: 'Kubernetes CSI Driver', href: '/kubernetes-csi' },
       { title: 'Licensing', href: '/licensing' },
     ],
   },

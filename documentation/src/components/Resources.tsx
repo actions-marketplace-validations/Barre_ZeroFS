@@ -10,10 +10,12 @@ import Link from 'next/link'
 
 import { GridPattern } from '@/components/GridPattern'
 import { Heading } from '@/components/Heading'
+import { ChevronRightLeftIcon } from '@/components/icons/ChevronRightLeftIcon'
 import { FolderIcon } from '@/components/icons/FolderIcon'
 import { PackageIcon } from '@/components/icons/PackageIcon'
 import { LinkIcon } from '@/components/icons/LinkIcon'
 import { ShapesIcon } from '@/components/icons/ShapesIcon'
+import { SquaresPlusIcon } from '@/components/icons/SquaresPlusIcon'
 
 interface Resource {
   href: string
@@ -31,7 +33,7 @@ const resources: Array<Resource> = [
     href: '/quickstart',
     name: 'Quickstart',
     description:
-      'Get up and running with ZeroFS in minutes. Install, configure, and mount your first S3 filesystem.',
+      'Install ZeroFS, generate a configuration, start the server, and mount the filesystem.',
     icon: ShapesIcon,
     pattern: {
       y: 16,
@@ -45,7 +47,7 @@ const resources: Array<Resource> = [
     href: '/nfs-access',
     name: 'NFS File Access',
     description:
-      'Mount ZeroFS as a network filesystem on any OS. Access files with standard POSIX operations.',
+      'Mount ZeroFS over NFSv3 from macOS, Linux, or Windows.',
     icon: FolderIcon,
     pattern: {
       y: 22,
@@ -59,7 +61,7 @@ const resources: Array<Resource> = [
     href: '/9p-access',
     name: '9P File Access',
     description:
-      'High-performance file access on Linux using the 9P protocol with advanced caching options.',
+      'Mount through stock Linux v9fs or the bundled FUSE client.',
     icon: LinkIcon,
     pattern: {
       y: -6,
@@ -70,16 +72,57 @@ const resources: Array<Resource> = [
     },
   },
   {
+    href: '/kernel-client',
+    name: 'Native Kernel Client',
+    description: 'Mount through the native module when one matches the kernel.',
+    icon: PackageIcon,
+    pattern: {
+      y: 10,
+      squares: [
+        [0, 2],
+        [2, 3],
+      ],
+    },
+  },
+  {
+    href: '/client-libraries',
+    name: 'Client Libraries',
+    description:
+      'Use path-based filesystem operations from Python, TypeScript, or Go without mounting.',
+    icon: ChevronRightLeftIcon,
+    pattern: {
+      y: 14,
+      squares: [
+        [0, 1],
+        [1, 3],
+      ],
+    },
+  },
+  {
     href: '/nbd-devices',
     name: 'NBD Block Devices',
     description:
-      'Create raw block devices backed by S3. Perfect for ZFS pools, databases, or any filesystem.',
+      'Attach files under .nbd as Linux block devices for filesystems, volume managers, or VM disks.',
     icon: PackageIcon,
     pattern: {
       y: 32,
       squares: [
         [0, 2],
         [1, 4],
+      ],
+    },
+  },
+  {
+    href: '/kubernetes-csi',
+    name: 'Kubernetes CSI Driver',
+    description:
+      'Dynamically provisioned persistent volumes backed by a shared ZeroFS gateway, mounted over 9P.',
+    icon: SquaresPlusIcon,
+    pattern: {
+      y: 8,
+      squares: [
+        [-1, 1],
+        [1, 2],
       ],
     },
   },
@@ -116,7 +159,7 @@ function ResourcePattern({
         />
       </div>
       <motion.div
-        className="absolute inset-0 rounded-2xl bg-linear-to-r from-[#dbeafe] to-[#e0e7ff] opacity-0 transition duration-300 group-hover:opacity-100 dark:from-[#1e293b] dark:to-[#1e3a8a]"
+        className="absolute inset-0 rounded-2xl bg-linear-to-r from-[#e2edfb] to-[#dbeafe] opacity-0 transition duration-300 group-hover:opacity-100 dark:from-[#16181c] dark:to-[#172234]"
         style={style}
       />
       <motion.div
@@ -159,7 +202,7 @@ function Resource({ resource }: { resource: Resource }) {
       <div className="absolute inset-0 rounded-2xl ring-1 ring-zinc-900/7.5 ring-inset group-hover:ring-zinc-900/10 dark:ring-white/10 dark:group-hover:ring-white/20" />
       <div className="relative rounded-2xl px-4 pt-16 pb-4">
         <ResourceIcon icon={resource.icon} />
-        <h3 className="mt-4 text-sm/7 font-semibold text-zinc-900 dark:text-white">
+        <h3 className="mt-4 text-sm/7 font-semibold text-zinc-900 dark:text-zinc-100">
           <Link href={resource.href}>
             <span className="absolute inset-0 rounded-2xl" />
             {resource.name}

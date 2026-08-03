@@ -15,8 +15,37 @@ service AdminService {
 
     rpc WatchFileAccess(WatchFileAccessRequest) returns (stream FileAccessEvent);
 
+    rpc WatchObjectAccess(WatchObjectAccessRequest) returns (stream ObjectAccessEvent);
+
     rpc Flush(FlushRequest) returns (FlushResponse);
+
+    rpc StreamStats(StreamStatsRequest) returns (stream StatsSnapshot);
+
+    rpc CreateDirectory(CreateDirectoryRequest) returns (CreateDirectoryResponse);
+
+    rpc RemoveDirectory(RemoveDirectoryRequest) returns (RemoveDirectoryResponse);
 }
+
+message CreateDirectoryRequest {
+    // Path from the filesystem root, e.g. /volumes/pvc-1234. Missing parent
+    // directories are created (mkdir -p semantics).
+    string path = 1;
+    uint32 mode = 2;
+    uint32 uid = 3;
+    uint32 gid = 4;
+}
+
+message CreateDirectoryResponse {
+    // True when this call created the directory at path, false when it
+    // already existed.
+    bool created = 1;
+}
+
+message RemoveDirectoryRequest {
+    string path = 1;
+}
+
+message RemoveDirectoryResponse {}
 
 message FlushRequest {}
 
@@ -81,6 +110,7 @@ enum FileOperation {
     MKNOD = 11;
     TRIM = 12;
     FSYNC = 13;
+    FALLOCATE = 14;
 }
 
 message OperationParams {
@@ -90,4 +120,107 @@ message OperationParams {
     optional string new_path = 4;
     optional string link_target = 5;
     optional string filename = 6;
+}
+
+message WatchObjectAccessRequest {}
+
+message ObjectAccessEvent {
+    google.protobuf.Timestamp timestamp = 1;
+    // Which backend store the request hit: "data" or "wal".
+    string store = 2;
+    ObjectOperation operation = 3;
+    // Object key (the location passed to the backend).
+    string path = 4;
+    ObjectParams params = 5;
+    // Wall-clock time the backend request took. Absent for stream-shaped ops
+    // (list, delete) where there is no single request to time.
+    optional uint64 duration_us = 6;
+    // True when the backend returned an error.
+    bool error = 7;
+}
+
+enum ObjectOperation {
+    OBJ_GET = 0;
+    OBJ_HEAD = 1;
+    OBJ_PUT = 2;
+    OBJ_PUT_MULTIPART = 3;
+    OBJ_DELETE = 4;
+    OBJ_LIST = 5;
+    OBJ_COPY = 6;
+    OBJ_RENAME = 7;
+}
+
+message ObjectParams {
+    // Byte offset of a ranged GET.
+    optional uint64 offset = 1;
+    // Number of bytes for a ranged GET, or the suffix length.
+    optional uint64 length = 2;
+    // Payload size of a PUT.
+    optional uint64 size = 3;
+    // Destination key of a COPY or RENAME.
+    optional string target_path = 4;
+}
+
+message StreamStatsRequest {
+    uint32 interval_ms = 1;
+}
+
+message StatsSnapshot {
+    google.protobuf.Timestamp timestamp = 1;
+    uint64 files_created = 2;
+    uint64 files_deleted = 3;
+    uint64 files_renamed = 4;
+    uint64 directories_created = 5;
+    uint64 directories_deleted = 6;
+    uint64 directories_renamed = 7;
+    uint64 links_created = 8;
+    uint64 links_deleted = 9;
+    uint64 links_renamed = 10;
+    uint64 read_operations = 11;
+    uint64 write_operations = 12;
+    uint64 bytes_read = 13;
+    uint64 bytes_written = 14;
+    uint64 tombstones_created = 15;
+    uint64 tombstones_processed = 16;
+    uint64 gc_extents_deleted = 17;
+    uint64 gc_runs = 18;
+    uint64 total_operations = 19;
+    uint64 used_bytes = 20;
+    uint64 used_inodes = 21;
+    uint64 max_bytes = 22;
+    // jemalloc memory stats
+    uint64 jemalloc_allocated = 23;
+    uint64 jemalloc_resident = 24;
+    uint64 jemalloc_mapped = 25;
+    uint64 jemalloc_retained = 26;
+    uint64 jemalloc_metadata = 27;
+    // Extent segment-store footprint + GC posture (empty until the first pass).
+    SegmentGcStatus segment_gc = 28;
+}
+
+message SegmentGcStatus {
+    bool has_run = 1;
+    // Whole-store footprint from the last reclaim pass's scan.
+    uint64 segment_count = 2;
+    uint64 appended_bytes = 3;
+    uint64 live_bytes = 4;
+    uint64 reclaimable_bytes = 5;
+    uint64 awaiting_delete = 6;
+    uint64 awaiting_delete_bytes = 7;
+    uint64 candidate_backlog = 8;
+    uint64 chains_deferred = 9;
+    bool saturated = 10;
+    // What the last pass did.
+    uint64 last_deleted = 11;
+    uint64 last_deleted_bytes = 12;
+    uint64 last_frames_relocated = 13;
+    uint64 last_chains_packed = 14;
+    uint64 last_chains_assembled = 15;
+    uint64 last_hot_seams = 16;
+    bool pinned = 17;
+    // Cadence posture: tier (0 none, 1 base, 2 drain, 3 fast) + the GC's reason.
+    uint32 tier = 18;
+    bool read_directed = 19;
+    string reason = 20;
+    uint64 unflushed_bytes = 21;
 }
