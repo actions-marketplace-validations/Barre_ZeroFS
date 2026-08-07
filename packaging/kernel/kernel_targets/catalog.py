@@ -53,12 +53,18 @@ REPOSITORY_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 PACKAGE_VERSION_PATTERN = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.+:~_-]*$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
-OCI_IMAGE_PATTERN = re.compile(
+OCI_REPOSITORY_PATTERN = (
     r"(?:(?:[a-z0-9]+(?:[.-][a-z0-9]+)*)(?::([1-9][0-9]{0,4}))?/)?"
     r"[a-z0-9]+(?:[._-][a-z0-9]+)*"
     r"(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*"
-    r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?"
+)
+OCI_TAG_PATTERN = r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}"
+OCI_DIGEST_IMAGE_PATTERN = re.compile(
+    rf"{OCI_REPOSITORY_PATTERN}(?::{OCI_TAG_PATTERN})?"
     r"@sha256:[0-9a-f]{64}$"
+)
+OCI_TAGGED_IMAGE_PATTERN = re.compile(
+    rf"{OCI_REPOSITORY_PATTERN}:{OCI_TAG_PATTERN}$"
 )
 FAMILIES = {"deb", "rpm"}
 ARCHITECTURES = {"x86_64", "aarch64"}
@@ -131,11 +137,21 @@ def validate_string(value: Any, label: str) -> None:
         fail(f"{label}: contains control characters")
 
 
-def validate_builder_image(value: Any, label: str) -> None:
+def validate_builder_image(
+    value: Any,
+    label: str,
+    *,
+    allow_tagged: bool = False,
+) -> None:
     validate_string(value, label)
-    match = OCI_IMAGE_PATTERN.fullmatch(value)
+    match = OCI_DIGEST_IMAGE_PATTERN.fullmatch(value)
+    if match is None and allow_tagged:
+        match = OCI_TAGGED_IMAGE_PATTERN.fullmatch(value)
     if match is None:
-        fail(f"{label}: must be a digest-pinned OCI image name")
+        requirement = "a digest-pinned OCI image name"
+        if allow_tagged:
+            requirement = "a tagged or digest-pinned OCI image name"
+        fail(f"{label}: must be {requirement}")
     port = match.group(1)
     if port is not None and int(port) > 65535:
         fail(f"{label}: registry port is out of range")
@@ -168,7 +184,11 @@ def validate_discovery(
     if distro != provider["distro"]:
         fail(f"{label}.kind: {kind} does not support {distro}")
 
-    validate_builder_image(value["builder_image"], f"{label}.builder_image")
+    validate_builder_image(
+        value["builder_image"],
+        f"{label}.builder_image",
+        allow_tagged=kind == "opensuse-history",
+    )
     validate_string(value["selector"], f"{label}.selector")
     if not REPOSITORY_TOKEN_PATTERN.fullmatch(value["selector"]):
         fail(f"{label}.selector: unsupported package name")
@@ -383,7 +403,12 @@ def validate_target(
     channel = channels.get(channel_id)
     if channel is None:
         fail(f"{label}.channel_id: unknown channel {channel_id!r}")
-    validate_builder_image(value["builder_image"], f"{label}.builder_image")
+    discovery_kind = channel["discovery"]["kind"]
+    validate_builder_image(
+        value["builder_image"],
+        f"{label}.builder_image",
+        allow_tagged=discovery_kind == "opensuse-history",
+    )
     source = validate_source(value["source"], f"{label}.source")
     expected_source_kind = DISCOVERY_PROVIDERS[
         channel["discovery"]["kind"]
@@ -393,7 +418,6 @@ def validate_target(
             f"{label}.source.kind: expected {expected_source_kind} "
             f"for channel {channel_id}"
         )
-    discovery_kind = channel["discovery"]["kind"]
     if discovery_kind == "fedora-koji":
         expected_selector_version = source["identity"].removeprefix("kernel-")
         if (
@@ -461,7 +485,12 @@ def validate_unsupported_target(value: Any, label: str) -> None:
             fail(f"{label}.{field}: unsupported path token")
 
 
-def validate_catalog(value: Any, label: str) -> Catalog:
+def validate_catalog(
+    value: Any,
+    label: str,
+    *,
+    allow_builder_image_drift: bool = False,
+) -> Catalog:
     if not isinstance(value, dict):
         fail(f"{label}: top level must be an object")
     expected_top_level = {
@@ -557,6 +586,17 @@ def validate_catalog(value: Any, label: str) -> Catalog:
                 f"{label}: publish target {target_id!r} is not the newest "
                 f"target in channel {channel_id!r}"
             )
+    if not allow_builder_image_drift:
+        for channel_id, (_, target_id) in revisions.items():
+            target_image = targets_by_id[target_id]["builder_image"]
+            channel_image = channels[channel_id]["discovery"]["builder_image"]
+            if target_image != channel_image:
+                fail(
+                    f"{label}: newest target {target_id!r} uses builder image "
+                    f"{target_image!r}, but channel {channel_id!r} configures "
+                    f"{channel_image!r}; apply a candidate to create a "
+                    "replacement target"
+                )
 
     return Catalog(
         document=copy.deepcopy(value),
@@ -566,5 +606,13 @@ def validate_catalog(value: Any, label: str) -> Catalog:
     )
 
 
-def load_catalog(path: Path) -> Catalog:
-    return validate_catalog(read_json(path, "manifest"), str(path))
+def load_catalog(
+    path: Path,
+    *,
+    allow_builder_image_drift: bool = False,
+) -> Catalog:
+    return validate_catalog(
+        read_json(path, "manifest"),
+        str(path),
+        allow_builder_image_drift=allow_builder_image_drift,
+    )
