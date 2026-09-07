@@ -766,7 +766,8 @@ mod tests {
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
             Arc::new(slatedb::object_store::memory::InMemory::new());
         let block_transformer: Arc<dyn slatedb::BlockTransformer> =
-            ZeroFsBlockTransformer::new_arc(&test_key, CompressionConfig::default());
+            ZeroFsBlockTransformer::try_new_arc(&test_key, CompressionConfig::default())
+                .expect("test key should be lockable");
         let db_path = DbPath::from("test_slatedb");
         let slatedb = Arc::new(
             DbBuilder::new(db_path.clone(), Arc::clone(&object_store))
@@ -779,7 +780,7 @@ mod tests {
         );
         let db_handle = SlateDbHandle::ReadWrite(slatedb);
         let fs = Arc::new(
-            ZeroFS::new_with_slatedb_and_lease(
+            ZeroFS::try_new(
                 db_handle.clone(),
                 u64::MAX,
                 None,
@@ -791,24 +792,19 @@ mod tests {
                 None,
                 crate::object_trace::ObjectTracer::new(),
                 Arc::clone(&object_store),
-                crate::frame_codec::FrameCodec::new(
+                crate::frame_codec::FrameCodec::try_new(
                     &test_key,
                     crate::segment::SEGMENT_INFO,
                     CompressionConfig::default(),
-                ),
-                None,
+                )
+                .expect("test key should be lockable"),
                 None,
             )
             .await
             .unwrap(),
         );
         fs.start_reclaim_drainer();
-        let checkpoint_manager = Arc::new(CheckpointManager::new(
-            db_handle,
-            db_path,
-            object_store,
-            None,
-        ));
+        let checkpoint_manager = Arc::new(CheckpointManager::new(db_handle, db_path, object_store));
         {
             let fc = fs.flush_coordinator.clone();
             checkpoint_manager.set_pre_flush(Arc::new(move || {

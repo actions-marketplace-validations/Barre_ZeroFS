@@ -34,7 +34,6 @@ type Reply = oneshot::Sender<Result<(), FsError>>;
 enum Request {
     Commit(Transaction, Reply),
     #[cfg(any(test, dst))]
-    #[allow(dead_code)]
     Barrier(Reply),
 }
 
@@ -109,7 +108,6 @@ impl WriteCoordinator {
     /// Wait until every commit submitted before this call has finished,
     /// including publication of its in-memory statistics.
     #[cfg(any(test, dst))]
-    #[allow(dead_code)]
     pub async fn barrier(&self) -> Result<(), FsError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
@@ -473,10 +471,7 @@ async fn worker_loop(
                     &ctx.key_codec.taint_key(),
                     &KeyCodec::encode_u64(ctx.lineage_token),
                     &slatedb::config::PutOptions::default(),
-                    &WriteOptions {
-                        await_durable: false,
-                        ..Default::default()
-                    },
+                    &WriteOptions::default(),
                 )
                 .await
             {
@@ -503,13 +498,7 @@ async fn worker_loop(
                         .invalidate_cache(directory_entry_cache_invalidations.iter().cloned());
 
                     let write_result = permit
-                        .write_with_options(
-                            merged,
-                            &WriteOptions {
-                                await_durable: false,
-                                ..Default::default()
-                            },
-                        )
+                        .write_with_options(merged, &WriteOptions::default())
                         .await;
 
                     drop(directory_cache_guard);
@@ -525,6 +514,8 @@ async fn worker_loop(
                     if let Some(permit) = apply_permit.take() {
                         permit.applied(SlateDbSeqno::new(slatedb_seq));
                     }
+                    ctx.flush_coordinator
+                        .mark_dirty_inodes(inode_cache_invalidations.iter().copied(), slatedb_seq);
                 }
                 Err(_) => result = Err(FsError::IoError),
             }
@@ -1098,7 +1089,8 @@ mod tests {
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
             Arc::new(slatedb::object_store::memory::InMemory::new());
         let block_transformer: Arc<dyn BlockTransformer> =
-            ZeroFsBlockTransformer::new_arc(&test_key, CompressionConfig::default());
+            ZeroFsBlockTransformer::try_new_arc(&test_key, CompressionConfig::default())
+                .expect("test key should be lockable");
         let raw_db = Arc::new(
             slatedb::DbBuilder::new(
                 slatedb::object_store::path::Path::from("ha-apply-failure"),
@@ -1111,13 +1103,14 @@ mod tests {
             .await
             .unwrap(),
         );
-        let segment_codec = crate::frame_codec::FrameCodec::new(
+        let segment_codec = crate::frame_codec::FrameCodec::try_new(
             &test_key,
             crate::segment::SEGMENT_INFO,
             CompressionConfig::default(),
-        );
+        )
+        .expect("test key should be lockable");
 
-        let fs = ZeroFS::new_with_slatedb_and_lease(
+        let fs = ZeroFS::try_new(
             crate::db::SlateDbHandle::ReadWrite(raw_db.clone()),
             u64::MAX,
             None,
@@ -1130,7 +1123,6 @@ mod tests {
             crate::object_trace::ObjectTracer::new(),
             object_store,
             segment_codec,
-            None,
             None,
         )
         .await

@@ -1,7 +1,10 @@
 use core::sync::atomic::Ordering;
 
 use kernel::{
-    alloc::{KVVec, flags::GFP_KERNEL},
+    alloc::{
+        KVVec,
+        flags::{GFP_KERNEL, GFP_NOWAIT},
+    },
     bindings, ffi,
     prelude::*,
 };
@@ -15,8 +18,30 @@ use super::errors::{codec_errno, not_connected_errno, protocol_errno};
 use super::reply::OwnedFrame;
 use super::session::{ReceiveLink, Session, SessionStatus};
 use super::slots::{PendingSlot, PendingState};
-use super::tag_space::{is_flush_tag, normal_tag_index};
-use super::{READ_PAYLOAD_OFFSET, SMALL_REPLY_BYTES, monotonic_ns};
+use super::{READ_PAYLOAD_OFFSET, SMALL_REPLY_BYTES};
+
+unsafe extern "C" {
+    fn zerofs_client_memalloc_nofs_save() -> ffi::c_uint;
+    fn zerofs_client_memalloc_nofs_restore(flags: ffi::c_uint);
+}
+
+/// Scope allocations away from filesystem reclaim while dispatch may be
+/// running under netfs writeback.
+struct NoFsAllocation(ffi::c_uint);
+
+impl NoFsAllocation {
+    fn enter() -> Self {
+        // SAFETY: the paired restore runs from Drop on this same task.
+        Self(unsafe { zerofs_client_memalloc_nofs_save() })
+    }
+}
+
+impl Drop for NoFsAllocation {
+    fn drop(&mut self) {
+        // SAFETY: this is the saved value returned by the matching enter.
+        unsafe { zerofs_client_memalloc_nofs_restore(self.0) };
+    }
+}
 
 /// The one stream accumulator of a session, held under `Session::receive`.
 ///
@@ -60,14 +85,20 @@ enum PublishedPayload {
 }
 
 impl Session {
-    /// Take a reusable metadata frame or allocate for this response.
-    fn reply_buffer(&self, frame_size: usize) -> Result<KVVec<u8>> {
+    /// Take a reusable metadata frame or allocate before sending a request.
+    pub(super) fn reply_buffer(&self, frame_size: usize) -> Result<KVVec<u8>> {
         if frame_size <= SMALL_REPLY_BYTES {
             if let Some(mut frame) = self.reply_pool.lock().pop() {
                 frame.clear();
                 return Ok(frame);
             }
+            // Keep fallback allocations pool-compatible. Otherwise dropping
+            // an unused pooled frame would permanently shrink the pool because
+            // its exact-sized replacement could not return.
+            let _nofs = NoFsAllocation::enter();
+            return Ok(KVVec::with_capacity(SMALL_REPLY_BYTES, GFP_KERNEL)?);
         }
+        let _nofs = NoFsAllocation::enter();
         Ok(KVVec::with_capacity(frame_size, GFP_KERNEL)?)
     }
 
@@ -86,34 +117,20 @@ impl Session {
     /// Select the connection task's next phase.
     ///
     /// A connected idle session deliberately passes this gate and sleeps in
-    /// `recvmsg`: request waiters own response deadlines and shut the socket
-    /// down when one expires. Only a completed Rflush pauses consumption,
-    /// because its owner must decide the fate of the request it cancelled
-    /// before any following stream bytes are interpreted.
+    /// `recvmsg`: request waiters probe only when the entire connection stops
+    /// making receive progress.
     fn next_io_phase(&self) -> IoPhase {
-        let mut state = self.state.lock();
-        loop {
-            if let SessionStatus::Dead(status) = state.status {
-                return IoPhase::Exit(status);
-            }
-            // SAFETY: This is the connection kthread created by Client.
-            if unsafe { bindings::kthread_should_stop() } {
-                return IoPhase::Exit(0);
-            }
-            match state.status {
-                SessionStatus::Lost => return IoPhase::Reconnect,
-                SessionStatus::Connected if !self.flush_reply_pending() => {
-                    return IoPhase::Receive(ReceiveLink {
-                        transport: state.transport.clone(),
-                        epoch: state.connection_epoch,
-                    });
-                }
-                SessionStatus::Connected | SessionStatus::Dead(_) => {}
-            }
-            // The timeout exists only to recheck kthread_should_stop().
-            let _ = self
-                .changed
-                .wait_interruptible_timeout(&mut state, self.timeout_jiffies);
+        let state = self.state.lock();
+        // SAFETY: This is the connection kthread created by Client.
+        let should_stop = unsafe { bindings::kthread_should_stop() };
+        match state.status {
+            SessionStatus::Dead(status) => IoPhase::Exit(status),
+            _ if should_stop => IoPhase::Exit(0),
+            SessionStatus::Connected => IoPhase::Receive(ReceiveLink {
+                transport: state.transport.clone(),
+                epoch: state.connection_epoch,
+            }),
+            SessionStatus::Lost => IoPhase::Reconnect,
         }
     }
 
@@ -139,8 +156,7 @@ impl Session {
                     loop {
                         let ReceiveState { buffer, buffered } = &mut *receive;
                         match self.receive_available(&link, buffer.as_mut_slice(), buffered) {
-                            Ok(false) => {}
-                            Ok(true) => break,
+                            Ok(()) => {}
                             Err(error) => {
                                 drop(receive);
                                 // An earlier caller retirement has already
@@ -157,37 +173,44 @@ impl Session {
 
     /// Take exclusive use of a tag's registered destination for one reply.
     ///
-    /// Declining costs nothing: the caller then runs the ordinary
-    /// allocate-and-copy receive, which the registered owner still handles.
+    /// `Ok(None)` means this is an unregistered read and the caller may use its
+    /// preallocated frame. A registered read must use its direct destination
+    /// because its preallocated frame covers only an error response.
     fn claim_read_destination(
         &self,
         link: &ReceiveLink,
         header: protocol::Header,
         payload_len: usize,
-    ) -> Option<ReadClaim<'_>> {
+    ) -> Result<Option<ReadClaim<'_>>> {
         if self.active_epoch.load(Ordering::Acquire) != link.epoch {
-            return None;
+            return Err(not_connected_errno());
         }
-        let tag = incoming_tag(header).ok()?;
-        let (shard, local_tag) = self.slot_shard(tag).ok()?;
+        let tag = incoming_tag(header)?;
+        let (shard, local_tag) = self.slot_shard(tag)?;
         let mut slots = shard.lock();
         if self.active_epoch.load(Ordering::Acquire) != link.epoch {
-            return None;
+            return Err(not_connected_errno());
         }
-        let slot = slots.get_mut(local_tag)?;
-        check_incoming_header(slot, header).ok()?;
-        let destination = slot.destination.as_mut()?;
+        let slot = slots.get_mut(local_tag).ok_or_else(protocol_errno)?;
+        check_incoming_header(slot, header)?;
+        let Some(destination) = slot.destination.as_mut() else {
+            return Ok(None);
+        };
         if destination.in_use || destination.delivered.is_some() || payload_len > destination.limit
         {
-            return None;
+            // Registered reads reserve only an Rlerror-sized allocation. Once
+            // an Rread names their tag, falling back to buffered receipt would
+            // violate that memory promise; these states are also impossible
+            // for a request with exactly one terminal response.
+            return Err(protocol_errno());
         }
         destination.in_use = true;
-        Some(ReadClaim {
+        Ok(Some(ReadClaim {
             session: self,
             tag,
             iterator: destination.iterator,
             payload_len,
-        })
+        }))
     }
 
     fn release_read_claim(&self, tag: usize) {
@@ -237,11 +260,18 @@ impl Session {
             .get(HEADER_SIZE..READ_PAYLOAD_OFFSET)
             .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
             .map(u32::from_le_bytes);
+        let claim = self.claim_read_destination(link, header, payload_len)?;
         // A count that does not cover exactly the rest of the frame leaves the
-        // payload bounds ambiguous. Declining hands the frame to the ordinary
-        // path, where decode_response rejects it.
+        // payload bounds ambiguous. An unregistered read hands the frame to
+        // the ordinary path, where decode_response rejects it. A registered
+        // read cannot buffer the declared payload in its small preallocated
+        // frame, so reject it at the header instead.
         if count != Some(payload_len as u32) {
-            return Ok(None);
+            return if claim.is_some() {
+                Err(protocol_errno())
+            } else {
+                Ok(None)
+            };
         }
 
         let buffered_payload = frame
@@ -255,7 +285,7 @@ impl Session {
             .get(READ_PAYLOAD_OFFSET..consumed)
             .ok_or_else(protocol_errno)?;
 
-        let Some(mut claim) = self.claim_read_destination(link, header, payload_len) else {
+        let Some(mut claim) = claim else {
             return Ok(None);
         };
         let filled = self.fill_read_destination(link, &mut claim, prefix);
@@ -286,7 +316,7 @@ impl Session {
         link: &ReceiveLink,
         buffer: &mut [u8],
         buffered: &mut usize,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         if *buffered > buffer.len() {
             return Err(protocol_errno());
         }
@@ -295,7 +325,6 @@ impl Session {
         loop {
             let mut offset = 0usize;
             let mut published = false;
-            let mut flush_barrier = false;
             while buffered.saturating_sub(offset) >= HEADER_SIZE {
                 let header_end = offset.checked_add(HEADER_SIZE).ok_or_else(protocol_errno)?;
                 let header_bytes = buffer.get(offset..header_end).ok_or_else(protocol_errno)?;
@@ -304,11 +333,17 @@ impl Session {
                 let frame_size = header.size as usize;
                 let available = buffered.saturating_sub(offset);
 
-                // An Rread can never use a reserved cancellation tag, whose
-                // slots only expect Rflush, so taking this path cannot
-                // step over the Tflush consumption barrier below.
-                if header.type_ == protocol::message_type::RREAD && available >= READ_PAYLOAD_OFFSET
-                {
+                if header.type_ == protocol::message_type::RREAD {
+                    if frame_size < READ_PAYLOAD_OFFSET {
+                        return Err(protocol_errno());
+                    }
+                    // A registered read reserved only an Rlerror-sized frame.
+                    // Do not route a fragmented Rread through that allocation
+                    // before its count field is present and direct delivery can
+                    // claim the destination.
+                    if available < READ_PAYLOAD_OFFSET {
+                        break;
+                    }
                     let frame = buffer.get(offset..*buffered).ok_or_else(protocol_errno)?;
                     if let Some(consumed) = self.try_direct_read(link, header, frame)? {
                         offset = offset.checked_add(consumed).ok_or_else(protocol_errno)?;
@@ -321,12 +356,11 @@ impl Session {
                 }
 
                 if frame_size > buffer.len() {
-                    // A large declaration is bounded by negotiated msize, but
-                    // validate its tag and expected response before allocating
-                    // or blocking for the remainder.
-                    self.validate_incoming_header(link, header)?;
+                    // A large declaration is bounded by negotiated msize. Take
+                    // the buffer its request allocated before entering the
+                    // stream, then receive the rest without any allocation.
                     let prefix = buffer.get(offset..*buffered).ok_or_else(protocol_errno)?;
-                    let mut frame = self.frame_with_prefix(prefix, frame_size)?;
+                    let mut frame = self.frame_with_prefix(link, header, prefix)?;
                     let remaining = frame_size
                         .checked_sub(prefix.len())
                         .ok_or_else(protocol_errno)?;
@@ -355,19 +389,10 @@ impl Session {
                 }
                 let frame_end = offset.checked_add(frame_size).ok_or_else(protocol_errno)?;
                 let frame_bytes = buffer.get(offset..frame_end).ok_or_else(protocol_errno)?;
-                let frame = self.frame_with_prefix(frame_bytes, frame_size)?;
+                let frame = self.frame_with_prefix(link, header, frame_bytes)?;
                 offset = frame_end;
-                let tag =
-                    self.publish_incoming_frame(link, header, PublishedPayload::Frame(frame))?;
+                self.publish_incoming_frame(link, header, PublishedPayload::Frame(frame))?;
                 published = true;
-
-                // Preserve the existing Tflush consumption barrier. Bytes
-                // already received after Rflush stay buffered until its owner
-                // vacates its cancellation slot.
-                if is_flush_tag(tag) {
-                    flush_barrier = true;
-                    break;
-                }
             }
 
             let remaining = buffered.checked_sub(offset).ok_or_else(protocol_errno)?;
@@ -377,12 +402,12 @@ impl Session {
             *buffered = remaining;
 
             if published {
-                return Ok(flush_barrier);
+                return Ok(());
             }
             if received {
                 // An incomplete buffered frame necessarily belongs to an
                 // outstanding request.
-                return Ok(false);
+                return Ok(());
             }
 
             let mut destination = buffer.get_mut(*buffered..).ok_or_else(protocol_errno)?;
@@ -406,23 +431,28 @@ impl Session {
         }
     }
 
-    /// Check an oversized frame's header before receiving its body.
+    /// Take the response allocation attached to an incoming frame's tag.
     ///
-    /// The slot-shard guard is dropped for that receive, so publication checks
-    /// the slot and connection epoch again.
-    fn validate_incoming_header(&self, link: &ReceiveLink, header: protocol::Header) -> Result<()> {
+    /// The slot stays `Sent` while a large body is received. Connection
+    /// retirement may fail the slot in the meantime, but it first changes
+    /// `active_epoch`, so publication below rejects this old frame.
+    fn take_reply_buffer(&self, link: &ReceiveLink, header: protocol::Header) -> Result<KVVec<u8>> {
         if self.active_epoch.load(Ordering::Acquire) != link.epoch {
             return Err(not_connected_errno());
         }
         let tag = incoming_tag(header)?;
         let (shard, local_tag) = self.slot_shard(tag)?;
-        let slots = shard.lock();
+        let mut slots = shard.lock();
         if self.active_epoch.load(Ordering::Acquire) != link.epoch {
             return Err(not_connected_errno());
         }
-        let slot = slots.get(local_tag).ok_or_else(protocol_errno)?;
+        let slot = slots.get_mut(local_tag).ok_or_else(protocol_errno)?;
         check_incoming_header(slot, header)?;
-        Ok(())
+        let buffer = slot.reply_buffer.take().ok_or_else(protocol_errno)?;
+        if buffer.capacity() < header.size as usize {
+            return Err(protocol_errno());
+        }
+        Ok(buffer)
     }
 
     /// Hand one complete reply to the waiter holding its tag.
@@ -431,7 +461,7 @@ impl Session {
         link: &ReceiveLink,
         header: protocol::Header,
         payload: PublishedPayload,
-    ) -> Result<usize> {
+    ) -> Result<()> {
         if let PublishedPayload::Frame(frame) = &payload {
             if frame.len() != header.size as usize {
                 return Err(protocol_errno());
@@ -454,32 +484,43 @@ impl Session {
         let slot = slots.get_mut(local_tag).ok_or_else(protocol_errno)?;
         check_incoming_header(slot, header)?;
         match payload {
-            PublishedPayload::Frame(frame) => slot.state = PendingState::Completed(frame),
+            PublishedPayload::Frame(frame) => {
+                if slot.reply_buffer.is_some() {
+                    return Err(protocol_errno());
+                }
+                slot.state = PendingState::Completed(frame);
+            }
             PublishedPayload::Direct(delivered) => {
                 let destination = slot.destination.as_mut().ok_or_else(protocol_errno)?;
                 destination.delivered = Some(delivered);
-                // An empty frame allocates nothing, so a directly delivered
-                // read performs no kvmalloc at all.
-                slot.state = PendingState::Completed(KVVec::new());
+                let mut frame = slot.reply_buffer.take().ok_or_else(protocol_errno)?;
+                frame.clear();
+                slot.state = PendingState::Completed(frame);
             }
         }
         drop(slots);
 
-        self.decrement_sent_count();
-        // Keep the clocksource read outside the tag critical section. On KVM
-        // this is visible in profiles, and no waiter needs the timestamp to
-        // consume a reply that is already complete.
-        self.last_frame_ns.store(monotonic_ns(), Ordering::Relaxed);
-        if normal_tag_index(tag).is_some() {
-            self.wake_reply_waiter(tag)?;
+        if self.finish_liveness_probe(tag, link.epoch)? {
+            return Ok(());
         }
-        Ok(tag)
+        // Keep liveness accounting outside the tag critical section. No
+        // waiter needs it in order to consume a reply already marked complete.
+        self.note_received_frame();
+        self.wake_reply_waiter(tag)?;
+        Ok(())
     }
 
-    /// Allocate or reuse a frame and copy in its accumulated prefix.
-    fn frame_with_prefix(&self, prefix: &[u8], frame_size: usize) -> Result<KVVec<u8>> {
-        let mut frame = self.reply_buffer(frame_size)?;
-        frame.extend_from_slice(prefix, GFP_KERNEL)?;
+    /// Fill the preallocated frame with its accumulated prefix.
+    fn frame_with_prefix(
+        &self,
+        link: &ReceiveLink,
+        header: protocol::Header,
+        prefix: &[u8],
+    ) -> Result<KVVec<u8>> {
+        let mut frame = self.take_reply_buffer(link, header)?;
+        // reserve_slot already allocated the complete declared capacity. This
+        // append therefore cannot need reclaim while the receiver holds a tag.
+        frame.extend_from_slice(prefix, GFP_NOWAIT)?;
         Ok(frame)
     }
 }
@@ -535,7 +576,11 @@ fn check_incoming_header(slot: &PendingSlot, header: protocol::Header) -> Result
         return Err(protocol_errno());
     }
     let expected = slot.expected.ok_or_else(protocol_errno)?;
-    if header.size as usize > slot.maximum_frame || !expected.matches_type(header.type_) {
+    let rlerror_size = HEADER_SIZE + core::mem::size_of::<u32>();
+    if header.size as usize > slot.maximum_frame
+        || (header.type_ == protocol::message_type::RLERROR && header.size as usize != rlerror_size)
+        || !expected.matches_type(header.type_)
+    {
         return Err(protocol_errno());
     }
     Ok(())

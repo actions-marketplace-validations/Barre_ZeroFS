@@ -3,8 +3,9 @@
 
 use crate::db::{Db, SlateDbHandle};
 use crate::frame_codec::FrameCodec;
+use crate::fs::errors::FsError;
 use crate::fs::flush_coordinator::FlushCoordinator;
-use crate::fs::inode::{DirectoryInode, Inode};
+use crate::fs::inode::{DirectoryInode, Inode, InodeId};
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::lock_manager::KeyedLockManager;
 use crate::fs::metrics::FileSystemStats;
@@ -24,7 +25,7 @@ use std::sync::Mutex;
 
 impl ZeroFS {
     /// Thin no-lease wrapper retained for the single-node constructors and tests;
-    /// the replication-aware server path calls `new_with_slatedb_and_lease`.
+    /// the replication-aware server path calls `try_new`.
     #[cfg(test)]
     pub async fn new_with_slatedb(
         slatedb: SlateDbHandle,
@@ -34,7 +35,7 @@ impl ZeroFS {
         object_store: Arc<dyn slatedb::object_store::ObjectStore>,
         segment_codec: FrameCodec,
     ) -> anyhow::Result<Self> {
-        Self::new_with_slatedb_and_lease(
+        Self::try_new(
             slatedb,
             max_bytes,
             metrics_recorder,
@@ -48,15 +49,14 @@ impl ZeroFS {
             object_store,
             segment_codec,
             None,
-            None,
         )
         .await
     }
 
-    /// Like [`new_with_slatedb`](Self::new_with_slatedb), with HA lease,
-    /// replication, and takeover-lineage state.
+    /// Construct the filesystem over an opened slatedb handle, with optional
+    /// HA lease, replication, and takeover-lineage state.
     #[allow(clippy::too_many_arguments)]
-    pub async fn new_with_slatedb_and_lease(
+    pub async fn try_new(
         slatedb: SlateDbHandle,
         max_bytes: u64,
         metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
@@ -70,7 +70,6 @@ impl ZeroFS {
         object_tracer: ObjectTracer,
         object_store: Arc<dyn slatedb::object_store::ObjectStore>,
         segment_codec: FrameCodec,
-        segment_warm: Option<crate::segment_store::SegmentWarmHook>,
         seal_threshold_override: Option<usize>,
     ) -> anyhow::Result<Self> {
         // The expiry reaper may already be running from CLI setup.
@@ -138,10 +137,7 @@ impl ZeroFS {
                 &root_inode_key,
                 &serialized,
                 &PutOptions::default(),
-                &WriteOptions {
-                    await_durable: false,
-                    ..Default::default()
-                },
+                &WriteOptions::default(),
             )
             .await?;
         }
@@ -159,12 +155,7 @@ impl ZeroFS {
 
         let flush_coordinator = FlushCoordinator::new(db.clone());
         let stats = Arc::new(FileSystemStats::new());
-        let segment_store = Arc::new(SegmentStore::new(
-            object_store,
-            segment_codec,
-            writer_epoch,
-            segment_warm,
-        ));
+        let segment_store = Arc::new(SegmentStore::new(object_store, segment_codec, writer_epoch));
         let extent_store = ExtentStore::new(
             db.clone(),
             key_codec.clone(),
@@ -176,8 +167,8 @@ impl ZeroFS {
         // segments before any write; from here they are maintained incrementally
         // off the commit path, so the panel never scans to stay current.
         extent_store.seed_footprint().await?;
-        // The flush path seals the open data-plane segment before flushing the
-        // manifest, so a durable manifest never references an un-PUT segment.
+        // A flush blocks SlateDB's manifest PUT until this hook has PUT the open
+        // ZeroFS segment.
         flush_coordinator.set_sealer({
             let es = extent_store.clone();
             Arc::new(move || {
@@ -238,6 +229,8 @@ impl ZeroFS {
             open_handles: Arc::new(DashMap::new()),
             reclaim_tx,
             reclaim_rx: Arc::new(Mutex::new(Some(reclaim_rx))),
+            reclaim_shutdown: tokio_util::sync::CancellationToken::new(),
+            reclaim_task: Arc::new(Mutex::new(None)),
             lock_manager,
             stats,
             global_stats,
@@ -292,10 +285,7 @@ impl ZeroFS {
             &key_codec.lineage_key(),
             &KeyCodec::encode_u64(token),
             &PutOptions::default(),
-            &WriteOptions {
-                await_durable: false,
-                ..Default::default()
-            },
+            &WriteOptions::default(),
         )
         .await?;
         // The lineage token is durable before serving starts.
@@ -303,29 +293,53 @@ impl ZeroFS {
         Ok(token)
     }
 
-    /// Client durability barrier (9P `Tfsync`, NFS COMMIT, NBD flush). A no-op when
-    /// `ignore_fsync` is set.
-    pub async fn client_fsync(&self) -> Result<(), crate::fs::errors::FsError> {
+    /// Global client durability barrier (NFS COMMIT, NBD flush, and internal
+    /// callers). A no-op when `ignore_fsync` is set.
+    pub async fn client_fsync(&self) -> Result<(), FsError> {
         if self.ignore_fsync {
             return Ok(());
         }
         self.flush_coordinator.flush().await
     }
 
-    /// Flush and verify the client's oldest unflushed-write lineage token.
-    /// Token zero means no unflushed write. A mismatched token returns `ESTALE`.
-    pub async fn client_fsync_verified(
-        &self,
-        client_token: u64,
-    ) -> Result<(), crate::fs::errors::FsError> {
+    /// Per-inode client durability barrier used by 9P. The underlying flush is
+    /// still global, but it can be skipped when an earlier flush already covered
+    /// this inode's most recent committed mutation.
+    pub async fn client_fsync_inode(&self, inode_id: InodeId) -> Result<(), FsError> {
+        if self.ignore_fsync {
+            return Ok(());
+        }
+        self.flush_coordinator.flush_inode(inode_id).await
+    }
+
+    /// Flush and verify the client's oldest unverified lineage token.
+    /// Token zero means no unverified mutation. A mismatch returns `ESTALE`.
+    pub async fn client_fsync_verified(&self, client_token: u64) -> Result<(), FsError> {
         if self.ignore_fsync {
             return Ok(());
         }
         self.flush_coordinator.flush().await?;
+        self.verify_fsync_lineage(client_token)
+    }
+
+    /// Per-inode form of [`Self::client_fsync_verified`] for scoped 9P `Tfsyncdur`.
+    pub async fn client_fsync_inode_verified(
+        &self,
+        inode_id: InodeId,
+        client_token: u64,
+    ) -> Result<(), FsError> {
+        if self.ignore_fsync {
+            return Ok(());
+        }
+        self.flush_coordinator.flush_inode(inode_id).await?;
+        self.verify_fsync_lineage(client_token)
+    }
+
+    fn verify_fsync_lineage(&self, client_token: u64) -> Result<(), FsError> {
         if client_token == 0 || client_token == self.lineage_token {
             Ok(())
         } else {
-            Err(crate::fs::errors::FsError::StaleHandle)
+            Err(FsError::StaleHandle)
         }
     }
 
@@ -347,7 +361,8 @@ impl ZeroFS {
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(object_store);
 
         let block_transformer: Arc<dyn BlockTransformer> =
-            ZeroFsBlockTransformer::new_arc(&test_key, CompressionConfig::default());
+            ZeroFsBlockTransformer::try_new_arc(&test_key, CompressionConfig::default())
+                .expect("test key should be lockable");
 
         let db_path = Path::from("test_slatedb");
         let slatedb = Arc::new(
@@ -359,11 +374,12 @@ impl ZeroFS {
                 .await?,
         );
 
-        let segment_codec = crate::frame_codec::FrameCodec::new(
+        let segment_codec = crate::frame_codec::FrameCodec::try_new(
             &test_key,
             crate::segment::SEGMENT_INFO,
             CompressionConfig::default(),
-        );
+        )
+        .expect("test key should be lockable");
         Self::new_with_slatedb(
             SlateDbHandle::ReadWrite(slatedb),
             u64::MAX,
@@ -388,7 +404,8 @@ impl ZeroFS {
 
         let test_key = [0u8; 32];
         let block_transformer: Arc<dyn BlockTransformer> =
-            ZeroFsBlockTransformer::new_arc(&test_key, CompressionConfig::default());
+            ZeroFsBlockTransformer::try_new_arc(&test_key, CompressionConfig::default())
+                .expect("test key should be lockable");
 
         let db_path = Path::from("test_slatedb");
         let reader = Arc::new(
@@ -406,11 +423,12 @@ impl ZeroFS {
             None,
             false,
             object_store,
-            crate::frame_codec::FrameCodec::new(
+            crate::frame_codec::FrameCodec::try_new(
                 &test_key,
                 crate::segment::SEGMENT_INFO,
                 CompressionConfig::default(),
-            ),
+            )
+            .expect("test key should be lockable"),
         )
         .await
     }
@@ -449,6 +467,19 @@ mod tests {
         fs.client_fsync_verified(fs.lineage_token.wrapping_add(1))
             .await
             .expect("the explicit ignore_fsync opt-out bypasses lineage verification");
+        fs.client_fsync_inode_verified(0, fs.lineage_token.wrapping_add(1))
+            .await
+            .expect("the per-inode barrier preserves the same explicit opt-out");
+    }
+
+    #[tokio::test]
+    async fn clean_inode_fsync_still_verifies_lineage() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        assert_eq!(
+            fs.client_fsync_inode_verified(0, fs.lineage_token.wrapping_add(1))
+                .await,
+            Err(FsError::StaleHandle)
+        );
     }
 
     #[tokio::test]
@@ -465,7 +496,8 @@ mod tests {
 
         let test_key = [0u8; 32];
         let block_transformer: Arc<dyn BlockTransformer> =
-            ZeroFsBlockTransformer::new_arc(&test_key, CompressionConfig::default());
+            ZeroFsBlockTransformer::try_new_arc(&test_key, CompressionConfig::default())
+                .expect("test key should be lockable");
 
         let db_path = Path::from("test_slatedb");
         let slatedb = Arc::new(
@@ -484,11 +516,12 @@ mod tests {
             None,
             false,
             object_store.clone(),
-            crate::frame_codec::FrameCodec::new(
+            crate::frame_codec::FrameCodec::try_new(
                 &test_key,
                 crate::segment::SEGMENT_INFO,
                 CompressionConfig::default(),
-            ),
+            )
+            .expect("test key should be lockable"),
         )
         .await
         .unwrap();

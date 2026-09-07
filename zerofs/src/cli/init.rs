@@ -8,9 +8,7 @@
 
 use crate::block_transformer::ZeroFsBlockTransformer;
 use crate::bucket_identity;
-use crate::cli::server::{
-    DatabaseMode, InitResult, SlateDbOpen, build_slatedb, parse_wal_object_store,
-};
+use crate::cli::server::{DatabaseMode, InitResult, SlateDbOpen, build_slatedb};
 use crate::config::Settings;
 use crate::db::SlateDbHandle;
 use crate::fs::{CacheConfig, ZeroFS};
@@ -19,6 +17,7 @@ use crate::object_trace::{ObjectTracer, TracingObjectStore};
 use crate::parse_object_store::parse_url_opts;
 use crate::replication::transport::{PromotionSnapshot, ReceiverControl};
 use crate::replication::{LineageProof, PromotionRetryGraceProof, ReplicationParams};
+use crate::secrets::EncryptionPassword;
 use crate::storage_class_object_store::with_storage_class;
 use anyhow::{Context, Result};
 use slatedb::BlockTransformer;
@@ -33,9 +32,8 @@ struct StartupContext {
     object_store: Arc<dyn object_store::ObjectStore>,
     /// Retrying store for direct ZeroFS I/O, including pre-serving HA ownership.
     retrying_object_store: Arc<dyn object_store::ObjectStore>,
-    wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
-    /// Shared by the data and WAL `TracingObjectStore` wrappers and handed to
-    /// the filesystem so the RPC server can stream backend requests (`otrace`).
+    /// Handed to the filesystem so the RPC server can stream backend requests
+    /// (`otrace`).
     object_tracer: ObjectTracer,
     actual_db_path: String,
     block_transformer: Arc<dyn BlockTransformer>,
@@ -67,13 +65,10 @@ struct HaReceiver {
 struct DbOpen {
     promotion: Option<PromotionSnapshot>,
     slatedb: SlateDbHandle,
+    manifest_publication: Option<crate::manifest_publication::ManifestPublication>,
     metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
     /// Prefetch-wrapped object store for the segment data plane (cold read-ahead).
     segment_object_store: Arc<dyn object_store::ObjectStore>,
-    /// Warms the parts cache with a just-sealed segment (multipart uploads bypass
-    /// the prefetcher's own write-through). Applies the same db-path prefix as
-    /// `segment_object_store` so the cache key matches the read path.
-    segment_warm: Option<crate::segment_store::SegmentWarmHook>,
 }
 
 /// Open database with a reconciled replication tail.
@@ -121,7 +116,11 @@ enum ReconcileOutcome {
 }
 
 impl StartupContext {
-    async fn prepare(settings: &Settings, db_mode: DatabaseMode) -> Result<Self> {
+    async fn prepare(
+        settings: &Settings,
+        db_mode: DatabaseMode,
+        password: EncryptionPassword,
+    ) -> Result<Self> {
         let url = settings.storage.url.clone();
 
         let cache_config = CacheConfig {
@@ -173,33 +172,33 @@ impl StartupContext {
                 .await?;
         }
 
-        let password = settings.storage.encryption_password.clone();
-        crate::cli::password::validate_password(&password).context("Password validation failed")?;
+        crate::cli::password::validate_password(password.expose_secret())
+            .context("Password validation failed")?;
 
         info!("Loading or initializing encryption key from object store");
         let db_path = Path::from(actual_db_path.clone());
         let encryption_key = key_management::load_or_init_encryption_key(
             &object_store,
             &db_path,
-            &password,
+            password,
             db_mode.is_read_only(),
         )
         .await
         .context("Failed to load or initialize encryption key")?;
 
-        let block_transformer: Arc<dyn BlockTransformer> =
-            ZeroFsBlockTransformer::new_arc(&encryption_key, settings.compression());
+        let block_transformer: Arc<dyn BlockTransformer> = ZeroFsBlockTransformer::try_new_arc(
+            encryption_key.expose_secret(),
+            settings.compression(),
+        )
+        .context("Failed to protect metadata encryption key in memory")?;
 
-        let wal_object_store: Option<Arc<dyn object_store::ObjectStore>> =
-            if let Some(wal_config) = &settings.wal {
-                info!("Using separate WAL object store: {}", wal_config.url);
-                Some(
-                    parse_wal_object_store(wal_config)
-                        .context("Failed to connect to WAL object store")?,
-                )
-            } else {
-                None
-            };
+        let segment_codec = crate::frame_codec::FrameCodec::try_new(
+            encryption_key.expose_secret(),
+            crate::segment::SEGMENT_INFO,
+            settings.compression(),
+        )
+        .context("Failed to protect segment encryption key in memory")?;
+        drop(encryption_key);
 
         let replication_params = settings
             .replication
@@ -213,33 +212,21 @@ impl StartupContext {
 
         // Trace at the bottom of the stack so otrace sees the requests that
         // actually leave the process. Everything above (length-check, prefetch,
-        // compactor) reads through these wrappers; cache hits make no backend
+        // compactor) reads through this wrapper; cache hits make no backend
         // request and so produce no event.
         let object_tracer = ObjectTracer::new();
-        let object_store = Arc::new(TracingObjectStore::new(
-            object_store,
-            object_tracer.clone(),
-            "data",
-        )) as Arc<dyn object_store::ObjectStore>;
-        let wal_object_store = wal_object_store.map(|s| {
-            Arc::new(TracingObjectStore::new(s, object_tracer.clone(), "wal"))
-                as Arc<dyn object_store::ObjectStore>
-        });
+        let object_store = Arc::new(TracingObjectStore::new(object_store, object_tracer.clone()))
+            as Arc<dyn object_store::ObjectStore>;
 
         Ok(Self {
             retrying_object_store: Arc::new(
                 crate::retrying_object_store::RetryingObjectStore::new(object_store.clone()),
             ),
             object_store,
-            wal_object_store,
             object_tracer,
             actual_db_path,
             block_transformer,
-            segment_codec: crate::frame_codec::FrameCodec::new(
-                &encryption_key,
-                crate::segment::SEGMENT_INFO,
-                settings.compression(),
-            ),
+            segment_codec,
             cache_config,
             dedup,
             replication_params,
@@ -500,15 +487,9 @@ impl StartupContext {
             .replication_params
             .as_ref()
             .filter(|_| !self.db_mode.is_read_only())
-            .map(|params| {
-                (
-                    params.node_id.clone(),
-                    params.force_recovery,
-                    self.recovering_handoff,
-                )
-            });
+            .map(|params| (params.node_id.clone(), self.recovering_handoff));
 
-        let Some((node_id, force, recovering_handoff)) = claim_request else {
+        let Some((node_id, recovering_handoff)) = claim_request else {
             return Ok(ClaimOutcome::Claimed(None));
         };
 
@@ -517,7 +498,7 @@ impl StartupContext {
         if let Some(receiver) = &self.ha {
             receiver.control.quiesce_heartbeat_acks().await;
         }
-        let claim_result = if recovering_handoff && !force {
+        let claim_result = if recovering_handoff {
             crate::replication::leader_record::recover_handoff(
                 &self.retrying_object_store,
                 &self.actual_db_path,
@@ -529,7 +510,6 @@ impl StartupContext {
                 &self.retrying_object_store,
                 &self.actual_db_path,
                 &node_id,
-                force,
             )
             .await
         };
@@ -540,12 +520,6 @@ impl StartupContext {
                     .downcast_ref::<crate::replication::leader_record::ClaimRejected>()
                     .is_some() =>
             {
-                if force {
-                    return Err(error).context(
-                        "HA: forced solo recovery raced another initializer; verify no \
-                         other process is using this database before retrying",
-                    );
-                }
                 tracing::warn!(
                     "HA: another initializer owns the durable pre-open claim \
                      ({error}); returning to role election"
@@ -628,7 +602,6 @@ impl StartupContext {
             self.db_mode,
             settings.lsm,
             self.block_transformer.clone(),
-            self.wal_object_store.clone(),
             self.replication_params.as_ref(),
         )
         .await
@@ -636,6 +609,7 @@ impl StartupContext {
 
         let SlateDbOpen {
             data: slatedb,
+            manifest_publication,
             metrics_recorder,
             parts_cache,
         } = opened;
@@ -714,31 +688,21 @@ impl StartupContext {
         // Retries sit under the prefetcher, so a single-flight window GET rides
         // out a transient error before failing every waiting reader, and above
         // the tracing layer, so each attempt is visible to otrace.
-        let prefetch = Arc::new(crate::object_store_prefetch::PrefetchingObjectStore::new(
-            self.retrying_object_store.clone(),
-            parts_cache,
-        ));
+        let prefetch: Arc<dyn object_store::ObjectStore> =
+            Arc::new(crate::object_store_prefetch::PrefetchingObjectStore::new(
+                self.retrying_object_store.clone(),
+                parts_cache,
+            ));
         let db_prefix = Path::from(self.actual_db_path.clone());
         let segment_object_store: Arc<dyn object_store::ObjectStore> =
-            Arc::new(object_store::prefix::PrefixStore::new(
-                Arc::clone(&prefetch) as Arc<dyn object_store::ObjectStore>,
-                db_prefix.clone(),
-            ));
-        // Warm the parts cache at seal time. `put_segment` passes the unprefixed
-        // object path, so prepend the db prefix exactly as PrefixStore would, giving
-        // the same cache key the read path derives.
-        let segment_warm: Option<crate::segment_store::SegmentWarmHook> =
-            Some(Arc::new(move |loc: &Path, bytes: bytes::Bytes| {
-                let full: Path = db_prefix.parts().chain(loc.parts()).collect();
-                prefetch.warm_object(&full, bytes);
-            }));
+            Arc::new(object_store::prefix::PrefixStore::new(prefetch, db_prefix));
 
         Ok(OpenOutcome::Opened(DbOpen {
             promotion,
             slatedb,
+            manifest_publication,
             metrics_recorder,
             segment_object_store,
-            segment_warm,
         }))
     }
 }
@@ -815,9 +779,9 @@ impl ReconciledDb {
         let DbOpen {
             promotion: _,
             slatedb,
+            manifest_publication,
             metrics_recorder,
             segment_object_store,
-            segment_warm,
         } = open;
         // Activation requires the Opening token and a reconciled tail.
         let ownership = match startup.opening.take() {
@@ -841,7 +805,6 @@ impl ReconciledDb {
         let StartupContext {
             object_store,
             retrying_object_store,
-            wal_object_store,
             object_tracer,
             actual_db_path,
             block_transformer: _,
@@ -1021,7 +984,7 @@ impl ReconciledDb {
         }
 
         let db_handle = slatedb.clone();
-        let fs = ZeroFS::new_with_slatedb_and_lease(
+        let fs = ZeroFS::try_new(
             slatedb,
             settings.max_bytes(),
             metrics_recorder,
@@ -1034,11 +997,15 @@ impl ReconciledDb {
             object_tracer.clone(),
             segment_object_store,
             segment_codec,
-            segment_warm,
             None,
         )
         .await
         .context("Failed to initialize filesystem")?;
+
+        if let Some(manifest_publication) = manifest_publication {
+            fs.flush_coordinator
+                .set_manifest_publication(manifest_publication);
+        }
 
         let fs = Arc::new(fs);
         // Reclaims open-unlinked inodes once their last open handle is dropped.
@@ -1060,7 +1027,6 @@ impl ReconciledDb {
             // admin and the checkpoint manager), whose listings would otherwise
             // fail on one transient backend error.
             object_store: retrying_object_store,
-            wal_object_store,
             db_path: actual_db_path,
             db_handle,
             authority,
@@ -1071,11 +1037,11 @@ impl ReconciledDb {
 /// Run role election, database open, reconciliation, and activation.
 pub async fn initialize_filesystem(
     settings: &Settings,
+    password: EncryptionPassword,
     db_mode: DatabaseMode,
 ) -> Result<InitResult> {
-    let mut startup = StartupContext::prepare(settings, db_mode)
-        .await?
-        .start_receiver()?;
+    let prepared = StartupContext::prepare(settings, db_mode, password).await?;
+    let mut startup = prepared.start_receiver()?;
     'role_election: loop {
         startup.become_writer().await?;
         startup.opening = match startup.claim_opening().await? {
@@ -1136,18 +1102,19 @@ mod role_decision_tests {
         let mut startup = StartupContext {
             object_store: store.clone(),
             retrying_object_store: store.clone(),
-            wal_object_store: None,
             object_tracer: crate::object_trace::ObjectTracer::new(),
             actual_db_path: "db".into(),
-            block_transformer: crate::block_transformer::ZeroFsBlockTransformer::new_arc(
+            block_transformer: crate::block_transformer::ZeroFsBlockTransformer::try_new_arc(
                 &[0; 32],
                 CompressionConfig::default(),
-            ),
-            segment_codec: crate::frame_codec::FrameCodec::new(
+            )
+            .expect("test key should be lockable"),
+            segment_codec: crate::frame_codec::FrameCodec::try_new(
                 &[0; 32],
                 crate::segment::SEGMENT_INFO,
                 CompressionConfig::default(),
-            ),
+            )
+            .expect("test key should be lockable"),
             cache_config: crate::fs::CacheConfig {
                 root_folder: std::env::temp_dir(),
                 max_cache_size_gb: 0.0,
@@ -1159,7 +1126,6 @@ mod role_decision_tests {
                 role: ReplicationRole::Leader,
                 peers: vec!["http://[invalid".into()],
                 replication_listen: None,
-                force_recovery: false,
             }),
             configured_replication_role: Some(ReplicationRole::Leader),
             db_mode: super::DatabaseMode::ReadWrite,
@@ -1184,7 +1150,7 @@ mod role_decision_tests {
         .await
         .expect("role election must inspect the initial ownership record");
 
-        let abandoned = crate::replication::leader_record::claim(&store, "db", "node-b", false)
+        let abandoned = crate::replication::leader_record::claim(&store, "db", "node-b")
             .await
             .unwrap();
         drop(abandoned);

@@ -408,6 +408,13 @@ impl Db {
         Arc::clone(&self.flush_barrier)
     }
 
+    /// Latest SlateDB sequence durably published to object storage.
+    pub(crate) fn durable_seq(&self) -> u64 {
+        self.status
+            .as_ref()
+            .map_or(0, |status| status.borrow().durable_seq)
+    }
+
     /// Attach the HA leader lease; reads/writes are then refused while it is
     /// invalid. Single-node `Db`s have no lease and are never gated.
     pub fn with_lease(mut self, lease: Arc<crate::replication::Lease>) -> Self {
@@ -817,7 +824,7 @@ impl Db {
                 segment
                     .compacted()
                     .iter()
-                    .flat_map(|run| run.sst_views.iter()),
+                    .flat_map(|run| run.sst_views().iter()),
             )
             .map(|view| view.sst.id)
             .collect();
@@ -889,7 +896,7 @@ impl Db {
                                 segment
                                     .compacted()
                                     .iter()
-                                    .flat_map(|run| run.sst_views.iter()),
+                                    .flat_map(|run| run.sst_views().iter()),
                             )
                             .map(|view| view.sst.id);
                         tracker.plan(manifest.id(), live)
@@ -1211,10 +1218,7 @@ mod scan_error_tests {
                     &key,
                     &value,
                     &PutOptions::default(),
-                    &WriteOptions {
-                        await_durable: false,
-                        ..Default::default()
-                    },
+                    &WriteOptions::default(),
                 )
                 .await
                 .unwrap();

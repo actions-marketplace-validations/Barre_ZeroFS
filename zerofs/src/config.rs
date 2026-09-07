@@ -1,3 +1,4 @@
+use crate::secrets::{CapturedPassword, EncryptionPassword};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::HashSet;
@@ -5,6 +6,7 @@ use std::fmt;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use zeroize::Zeroize;
 
 /// Compression algorithm configuration for extent data.
 /// Supports lz4 and zstd.
@@ -86,49 +88,7 @@ impl<'de> Deserialize<'de> for CompressionConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct WalConfig {
-    #[serde(deserialize_with = "deserialize_expandable_string")]
-    pub url: String,
-    /// Object storage class/tier for WAL writes.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_optional_expandable_string"
-    )]
-    pub storage_class: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub aws: Option<AwsConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub azure: Option<AzureConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gcp: Option<GcsConfig>,
-}
-
-impl WalConfig {
-    pub fn cloud_provider_env_vars(&self) -> Vec<(String, String)> {
-        let mut env_vars = Vec::new();
-        if let Some(aws) = &self.aws {
-            for (k, v) in &aws.0 {
-                env_vars.push((format!("aws_{}", k.to_lowercase()), v.clone()));
-            }
-        }
-        if let Some(azure) = &self.azure {
-            for (k, v) in &azure.0 {
-                env_vars.push((format!("azure_{}", k.to_lowercase()), v.clone()));
-            }
-        }
-        if let Some(gcp) = &self.gcp {
-            for (k, v) in &gcp.0 {
-                env_vars.push((format!("google_{}", k.to_lowercase()), v.clone()));
-            }
-        }
-        env_vars
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     pub cache: CacheConfig,
@@ -140,15 +100,12 @@ pub struct Settings {
     pub lsm: Option<LsmConfig>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub gc: Option<GcConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing)]
     pub aws: Option<AwsConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing)]
     pub azure: Option<AzureConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing)]
     pub gcp: Option<GcsConfig>,
-    /// Location of a pre-2.0 volume's separate WAL store.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub wal: Option<WalConfig>,
     #[serde(skip_serializing_if = "Option::is_none", default = "default_telemetry")]
     pub telemetry: Option<TelemetryConfig>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -216,10 +173,6 @@ pub struct ReplicationConfig {
         default
     )]
     pub replication_listen: Option<String>,
-    /// One-startup authorization to replace durable HA ownership.
-    /// All former participants must be stopped before this is enabled.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub force_recovery: bool,
 }
 
 impl ReplicationConfig {
@@ -277,26 +230,9 @@ impl ReplicationConfig {
             );
         }
 
-        if self.force_recovery {
-            if self.role != ReplicationRole::Leader {
-                anyhow::bail!("[replication] force_recovery = true requires role = \"leader\"");
-            }
-            if !self.peers.is_empty() {
-                anyhow::bail!(
-                    "[replication] force_recovery = true requires peers = []; verify every \
-                     former peer is down before removing it from the configuration"
-                );
-            }
-            tracing::warn!(
-                "[replication] force_recovery is enabled for node {:?}; this may fence a live \
-                 partitioned writer. Remove force_recovery after this recovery startup succeeds",
-                self.node_id
-            );
-        }
-
         // Automatic role swaps require both a local endpoint and a peer.
         let (has_peers, has_listen) = (!self.peers.is_empty(), self.replication_listen.is_some());
-        if !self.force_recovery && has_peers != has_listen {
+        if has_peers != has_listen {
             anyhow::bail!(
                 "[replication] automatic HA requires peers and replication_listen together; \
                  configure both for role swaps, or neither for a standalone node"
@@ -338,13 +274,18 @@ pub struct CacheConfig {
     pub warm_metadata: WarmMetadata,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     #[serde(deserialize_with = "deserialize_expandable_string")]
     pub url: String,
-    #[serde(deserialize_with = "deserialize_expandable_string")]
-    pub encryption_password: String,
+    /// Serde needs a field to deserialize into; `from_file` immediately moves
+    /// the value out, so this is always `None` outside `from_file`.
+    #[serde(
+        deserialize_with = "deserialize_captured_encryption_password",
+        skip_serializing
+    )]
+    encryption_password: Option<CapturedPassword>,
     /// Object storage class/tier for data writes, passed through verbatim as the
     /// per-backend tiering header.
     #[serde(
@@ -405,14 +346,6 @@ pub struct LsmConfig {
     /// buffered until the next flush.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub sync_writes: Option<bool>,
-    /// Deprecated, ignored: the WAL is permanently off (sealing correctness
-    /// requires it). Accepted so pre-2.0 configs still parse; never re-emitted.
-    #[serde(default, skip_serializing)]
-    pub wal_enabled: Option<bool>,
-    /// Deprecated, ignored: unflushed-data budgeting went away with the WAL.
-    /// Accepted so pre-2.0 configs still parse; never re-emitted.
-    #[serde(default, skip_serializing)]
-    pub max_unflushed_gb: Option<f64>,
 }
 
 impl LsmConfig {
@@ -731,8 +664,13 @@ pub struct PrometheusConfig {
     pub addresses: HashSet<SocketAddr>,
 }
 
-#[derive(Debug, Serialize, Clone)]
 pub struct AwsConfig(pub std::collections::HashMap<String, String>);
+
+impl std::fmt::Debug for AwsConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AwsConfig([REDACTED])")
+    }
+}
 
 impl<'de> Deserialize<'de> for AwsConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -743,8 +681,13 @@ impl<'de> Deserialize<'de> for AwsConfig {
     }
 }
 
-#[derive(Debug, Serialize, Clone)]
 pub struct AzureConfig(pub std::collections::HashMap<String, String>);
+
+impl std::fmt::Debug for AzureConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AzureConfig([REDACTED])")
+    }
+}
 
 impl<'de> Deserialize<'de> for AzureConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -755,8 +698,13 @@ impl<'de> Deserialize<'de> for AzureConfig {
     }
 }
 
-#[derive(Debug, Serialize, Clone)]
 pub struct GcsConfig(pub std::collections::HashMap<String, String>);
+
+impl std::fmt::Debug for GcsConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GcsConfig([REDACTED])")
+    }
+}
 
 impl<'de> Deserialize<'de> for GcsConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -824,6 +772,38 @@ where
             e
         ))),
     }
+}
+
+fn deserialize_captured_encryption_password<'de, D>(
+    deserializer: D,
+) -> Result<Option<CapturedPassword>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct CaptureVisitor;
+
+    impl de::Visitor<'_> for CaptureVisitor {
+        type Value = CapturedPassword;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a string")
+        }
+
+        // For a plain TOML literal, `v` borrows from the locked config buffer,
+        // so the password goes locked-to-locked with no unprotected stop.
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(CapturedPassword::capture(v))
+        }
+
+        // Escaped TOML strings arrive as an owned copy; wipe it after capture.
+        fn visit_string<E: de::Error>(self, mut v: String) -> Result<Self::Value, E> {
+            let captured = CapturedPassword::capture(&v);
+            v.zeroize();
+            Ok(captured)
+        }
+    }
+
+    deserializer.deserialize_str(CaptureVisitor).map(Some)
 }
 
 fn deserialize_optional_expandable_string<'de, D>(
@@ -966,17 +946,33 @@ impl Settings {
             .unwrap_or_default()
     }
 
-    pub fn from_file(config_path: impl AsRef<std::path::Path>) -> Result<Self> {
+    /// Load the config and move the encryption password straight into locked
+    /// memory.
+    pub(crate) fn from_file(
+        config_path: impl AsRef<std::path::Path>,
+    ) -> Result<(Self, EncryptionPassword)> {
         let path = config_path.as_ref();
-        let content = fs::read_to_string(path)
+        let content = crate::secrets::read_file_locked(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
-        let settings: Settings = toml::from_str(&content)
+        let mut settings: Settings = toml::from_str(content.expose_secret())
             .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+
+        let password = match settings
+            .storage
+            .encryption_password
+            .take()
+            .context("Missing required field `storage.encryption_password`")?
+        {
+            CapturedPassword::Locked(password) => password.expand_environment()?,
+            CapturedPassword::Failed(error) => {
+                return Err(error).context("Failed to protect encryption password in memory");
+            }
+        };
 
         settings.validate()?;
 
-        Ok(settings)
+        Ok((settings, password))
     }
 
     /// Cross-section validation applied after deserialization.
@@ -997,23 +993,6 @@ impl Settings {
             );
         }
 
-        // Deprecated [lsm] keys still parse (an upgrade must not brick startup
-        // on an old config) but no longer do anything; nudge the operator to
-        // drop them.
-        if let Some(lsm) = &self.lsm {
-            if lsm.wal_enabled.is_some() {
-                tracing::warn!(
-                    "[lsm] wal_enabled is deprecated and ignored (the WAL is permanently off); \
-                     remove it from the config"
-                );
-            }
-            if lsm.max_unflushed_gb.is_some() {
-                tracing::warn!(
-                    "[lsm] max_unflushed_gb is deprecated and ignored (it tuned the removed WAL); \
-                     remove it from the config"
-                );
-            }
-        }
         Ok(())
     }
 
@@ -1038,16 +1017,6 @@ impl Settings {
     }
 
     pub fn generate_default() -> Self {
-        let mut aws_config = std::collections::HashMap::new();
-        aws_config.insert(
-            "access_key_id".to_string(),
-            "${AWS_ACCESS_KEY_ID}".to_string(),
-        );
-        aws_config.insert(
-            "secret_access_key".to_string(),
-            "${AWS_SECRET_ACCESS_KEY}".to_string(),
-        );
-
         Settings {
             cache: CacheConfig {
                 dir: PathBuf::from("${HOME}/.cache/zerofs"),
@@ -1057,7 +1026,7 @@ impl Settings {
             },
             storage: StorageConfig {
                 url: "s3://your-bucket/zerofs-data".to_string(),
-                encryption_password: "${ZEROFS_PASSWORD}".to_string(),
+                encryption_password: None,
                 storage_class: None,
             },
             servers: ServerConfig {
@@ -1085,10 +1054,9 @@ impl Settings {
             filesystem: None,
             lsm: None,
             gc: None,
-            aws: Some(AwsConfig(aws_config)),
+            aws: None,
             azure: None,
             gcp: None,
-            wal: None,
             telemetry: None,
             prometheus: None,
             replication: None,
@@ -1099,13 +1067,17 @@ impl Settings {
         let default = Self::generate_default();
         let mut toml_string = toml::to_string_pretty(&default)?;
 
-        // Inject a commented storage_class hint into the [storage] section. It
-        // can't be appended like the others below because [storage] is not the
-        // last table in the serialized output.
         toml_string = toml_string.replace(
-            "encryption_password = \"${ZEROFS_PASSWORD}\"\n",
-            "encryption_password = \"${ZEROFS_PASSWORD}\"\n\
+            "url = \"s3://your-bucket/zerofs-data\"\n",
+            "url = \"s3://your-bucket/zerofs-data\"\n\
+             encryption_password = \"${ZEROFS_PASSWORD}\"\n\
              # storage_class = \"...\"   # Optional object storage class/tier for all writes (provider-specific value).\n"
+        );
+
+        toml_string.push_str(
+            "\n[aws]\n\
+             access_key_id = \"${AWS_ACCESS_KEY_ID}\"\n\
+             secret_access_key = \"${AWS_SECRET_ACCESS_KEY}\"\n",
         );
 
         // Document warm_metadata in place (the [cache] table is not last, so the
@@ -1208,9 +1180,6 @@ impl Settings {
         toml_string.push_str("# replication_listen = \"10.0.0.1:9000\"  # this node receives ships + heartbeats here\n");
         toml_string.push_str(
             "# peers = [\"10.0.0.2:9000\"]             # the other node's replication_listen\n",
-        );
-        toml_string.push_str(
-            "# force_recovery = false                   # break-glass override; see HA recovery docs\n",
         );
 
         toml_string.push_str("\n# Optional Prometheus metrics endpoint\n");
@@ -1335,9 +1304,13 @@ encryption_password = "${ZEROFS_TEST_PASSWORD}"
         let temp_file = NamedTempFile::new().unwrap();
         std::fs::write(temp_file.path(), config_content).unwrap();
 
-        let settings = Settings::from_file(temp_file.path().to_str().unwrap()).unwrap();
+        let (settings, password) = Settings::from_file(temp_file.path().to_str().unwrap()).unwrap();
         assert_eq!(settings.storage.url, "s3://my-bucket/data");
-        assert_eq!(settings.storage.encryption_password, "secret123");
+        assert_eq!(password.expose_secret(), "secret123");
+        assert!(!format!("{settings:?}").contains("secret123"));
+        let serialized = toml::to_string(&settings).unwrap();
+        assert!(!serialized.contains("secret123"));
+        assert!(!serialized.contains("encryption_password"));
     }
 
     #[test]
@@ -1365,7 +1338,7 @@ unix_socket = "${ZEROFS_TEST_HOME}/zerofs.sock"
         let temp_file = NamedTempFile::new().unwrap();
         std::fs::write(temp_file.path(), config_content).unwrap();
 
-        let settings = Settings::from_file(temp_file.path().to_str().unwrap()).unwrap();
+        let (settings, _) = Settings::from_file(temp_file.path().to_str().unwrap()).unwrap();
 
         assert_eq!(settings.cache.dir, home_dir.join("test-cache"));
         assert_eq!(
@@ -1381,6 +1354,7 @@ unix_socket = "${ZEROFS_TEST_HOME}/zerofs.sock"
 
     #[test]
     fn test_undefined_env_var_error() {
+        const LITERAL_PREFIX: &str = "must-not-appear-in-error";
         let config_content = r#"
 [cache]
 dir = "/tmp/cache"
@@ -1388,7 +1362,7 @@ disk_size_gb = 1.0
 
 [storage]
 url = "s3://bucket/data"
-encryption_password = "${ZEROFS_TEST_UNDEFINED_VAR_THAT_SHOULD_NOT_EXIST}"
+encryption_password = "must-not-appear-in-error-${ZEROFS_TEST_UNDEFINED_VAR_THAT_SHOULD_NOT_EXIST}"
 
 [servers]
 "#;
@@ -1404,6 +1378,38 @@ encryption_password = "${ZEROFS_TEST_UNDEFINED_VAR_THAT_SHOULD_NOT_EXIST}"
             "Error was: {}",
             error
         );
+        assert!(
+            !error.contains(LITERAL_PREFIX),
+            "Error leaked config: {error}"
+        );
+        assert!(
+            !error.contains("encryption_password ="),
+            "Error leaked the TOML source line: {error}"
+        );
+    }
+
+    #[test]
+    fn missing_encryption_password_has_an_accurate_error() {
+        let config_content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+
+[servers]
+"#;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        std::fs::write(temp_file.path(), config_content).unwrap();
+
+        let error = format!("{:#}", Settings::from_file(temp_file.path()).unwrap_err());
+        assert!(
+            error.contains("missing field `encryption_password`"),
+            "Error was: {error}"
+        );
+        assert!(!error.contains("already been consumed"));
     }
 
     #[test]
@@ -1429,7 +1435,7 @@ encryption_password = "test"
         let temp_file = NamedTempFile::new().unwrap();
         std::fs::write(temp_file.path(), config_content).unwrap();
 
-        let settings = Settings::from_file(temp_file.path().to_str().unwrap()).unwrap();
+        let (settings, _) = Settings::from_file(temp_file.path().to_str().unwrap()).unwrap();
         assert_eq!(settings.cache.dir, home_dir.join("mydir/cache"));
     }
 
@@ -1463,7 +1469,16 @@ storage_account_key = "${ZEROFS_TEST_AZURE_KEY}"
         let temp_file = NamedTempFile::new().unwrap();
         std::fs::write(temp_file.path(), config_content).unwrap();
 
-        let settings = Settings::from_file(temp_file.path().to_str().unwrap()).unwrap();
+        let (settings, _) = Settings::from_file(temp_file.path().to_str().unwrap()).unwrap();
+
+        let debug = format!("{settings:?}");
+        assert!(!debug.contains("aws_secret"));
+        assert!(!debug.contains("azure456"));
+        let serialized = toml::to_string(&settings).unwrap();
+        assert!(!serialized.contains("aws_secret"));
+        assert!(!serialized.contains("azure456"));
+        assert!(!serialized.contains("[aws]"));
+        assert!(!serialized.contains("[azure]"));
 
         let aws = settings.aws.unwrap();
         assert_eq!(aws.0.get("access_key_id").unwrap(), "aws123");
@@ -1518,7 +1533,7 @@ allow_http = "true"
         std::fs::write(temp_file.path(), config_with_string).unwrap();
         let result = Settings::from_file(temp_file.path().to_str().unwrap());
         assert!(result.is_ok());
-        let settings = result.unwrap();
+        let (settings, _) = result.unwrap();
         assert_eq!(settings.aws.unwrap().0.get("allow_http").unwrap(), "true");
     }
 
@@ -1543,7 +1558,7 @@ encryption_password = "test"
     fn write_and_load(content: &str) -> Result<Settings> {
         let temp_file = NamedTempFile::new().unwrap();
         std::fs::write(temp_file.path(), content).unwrap();
-        Settings::from_file(temp_file.path().to_str().unwrap())
+        Settings::from_file(temp_file.path().to_str().unwrap()).map(|(settings, _)| settings)
     }
 
     #[test]
@@ -1752,74 +1767,15 @@ tail_scrub_min_dead_percent = 10"#,
         assert_eq!(gc.tail_scrub_min_dead_percent(), Some(10));
     }
 
-    // Pre-2.0 configs set the removed [lsm] wal_enabled / max_unflushed_gb
-    // keys; they must still parse (ignored, with a warning) so an upgrade
-    // doesn't brick startup, and must be dropped on re-serialization.
-    #[test]
-    fn test_deprecated_lsm_keys_parse_and_round_trip() {
-        let content = base_config_with_replication(
-            r#"[lsm]
-wal_enabled = true
-max_unflushed_gb = 2.0
-flush_interval_secs = 30"#,
-        );
-        let settings = write_and_load(&content).unwrap();
-        let lsm = settings.lsm.as_ref().unwrap();
-        assert_eq!(lsm.wal_enabled, Some(true));
-        assert_eq!(lsm.max_unflushed_gb, Some(2.0));
-        assert_eq!(lsm.flush_interval_secs, Some(30));
-
-        // Round-trip: the deprecated keys are never re-emitted, and the
-        // result still parses.
-        let serialized = toml::to_string(&settings).unwrap();
-        assert!(!serialized.contains("wal_enabled"), "got: {serialized}");
-        assert!(
-            !serialized.contains("max_unflushed_gb"),
-            "got: {serialized}"
-        );
-        let reparsed: Settings = toml::from_str(&serialized).unwrap();
-        let lsm = reparsed.lsm.unwrap();
-        assert!(lsm.wal_enabled.is_none());
-        assert!(lsm.max_unflushed_gb.is_none());
-        assert_eq!(lsm.flush_interval_secs, Some(30));
-    }
-
-    // deny_unknown_fields still catches typos: only the two deprecated keys
-    // get a pass.
+    // deny_unknown_fields catches misspelled LSM settings.
     #[test]
     fn test_unknown_lsm_key_still_rejected() {
         let content = base_config_with_replication(
             r#"[lsm]
-wal_enable = true"#,
+flush_interval_sec = 30"#,
         );
         let err = format!("{:#}", write_and_load(&content).unwrap_err());
         assert!(err.contains("unknown field"), "got: {err}");
-    }
-
-    // The generated config must not resurrect the deprecated keys, nor
-    // advertise the [wal] section (accepted only for upgraded 1.x volumes;
-    // new volumes never write a WAL).
-    #[test]
-    fn test_generated_config_omits_deprecated_lsm_keys() {
-        let rendered = Settings::render_default_config().unwrap();
-        assert!(!rendered.contains("wal_enabled"));
-        assert!(!rendered.contains("max_unflushed_gb"));
-        assert!(!rendered.contains("[wal]"));
-    }
-
-    // A pre-2.0 config with a custom [wal] location must keep parsing: the
-    // upgraded volume needs it to open (WAL replay / checkpoint references).
-    #[test]
-    fn test_wal_section_still_parses() {
-        let content = base_config_with_replication(
-            r#"[wal]
-url = "file:///mnt/nvme/zerofs-wal""#,
-        );
-        let settings = write_and_load(&content).unwrap();
-        assert_eq!(
-            settings.wal.as_ref().map(|w| w.url.as_str()),
-            Some("file:///mnt/nvme/zerofs-wal")
-        );
     }
 
     #[test]
@@ -1930,45 +1886,6 @@ replication_listen = "127.0.0.1:5599""#,
             err.contains("requires peers and replication_listen together"),
             "got: {err}"
         );
-    }
-
-    #[test]
-    fn replication_force_recovery_requires_leader() {
-        let content = base_config_with_replication(
-            r#"[replication]
-node_id = "n1"
-role = "standby"
-replication_listen = "127.0.0.1:5599"
-force_recovery = true"#,
-        );
-        let err = format!("{:#}", write_and_load(&content).unwrap_err());
-        assert!(err.contains("requires role = \"leader\""), "got: {err}");
-    }
-
-    #[test]
-    fn replication_force_recovery_requires_no_peers() {
-        let content = base_config_with_replication(
-            r#"[replication]
-node_id = "n1"
-role = "leader"
-peers = ["127.0.0.1:5600"]
-force_recovery = true"#,
-        );
-        let err = format!("{:#}", write_and_load(&content).unwrap_err());
-        assert!(err.contains("requires peers = []"), "got: {err}");
-    }
-
-    #[test]
-    fn replication_force_recovery_is_explicit_and_valid_for_solo_leader() {
-        let content = base_config_with_replication(
-            r#"[replication]
-node_id = "n1"
-role = "leader"
-replication_listen = "127.0.0.1:5599"
-force_recovery = true"#,
-        );
-        let repl = write_and_load(&content).unwrap().replication.unwrap();
-        assert!(repl.force_recovery);
     }
 
     #[test]

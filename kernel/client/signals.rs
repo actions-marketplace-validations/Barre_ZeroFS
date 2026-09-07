@@ -8,8 +8,10 @@ use super::errors::is_interrupted_error;
 ///
 /// A complete 9P frame cannot be abandoned halfway through a stream send.
 /// Signals remain pending while the transmit mutex is held and are observed by
-/// the reply wait afterward, which retires the request through Tflush. Drop
-/// restores the task's exact prior mask and recalculates pending signals.
+/// the reply wait afterward, which keeps owning the request until its terminal
+/// reply. An `OpAttempt` can also hold this guard while a request resolves
+/// across reconnect.
+/// Drop restores the task's exact prior mask and recalculates pending signals.
 pub(super) struct SendSignalMask {
     saved: bindings::sigset_t,
 }
@@ -46,7 +48,7 @@ impl Drop for SendSignalMask {
             )
         };
         if status < 0 {
-            pr_err!("failed to restore signal mask after Tflush: errno={status}\n");
+            pr_err!("failed to restore request signal mask: errno={status}\n");
         }
     }
 }
@@ -67,8 +69,7 @@ pub(super) fn resume_interrupted_send(
     }
 }
 
-/// Sleep despite a pending signal while consuming one jiffy of a bounded
-/// cancellation budget.
+/// Sleep despite a pending signal while consuming one jiffy of a bounded wait.
 pub(super) fn sleep_uninterruptible_tick(remaining: &mut usize) -> bool {
     if *remaining == 0 {
         return false;

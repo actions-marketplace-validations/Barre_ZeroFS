@@ -28,8 +28,8 @@
 //!
 //! [`session`] holds connection state, [`slots`] the tag table, [`retry`] request
 //! transmission, [`receive`] socket reads and reply routing, and [`reply`] each
-//! caller's tag wait. [`flush`] cancels interrupted requests; [`signals`] owns
-//! the task signal masks used while sending and cancelling.
+//! caller's tag wait. [`signals`] owns the task signal masks used to finish
+//! dispatched stream operations without abandoning their replies.
 //!
 //! [`registry`] records fid and lock replay state and interns credentials,
 //! [`durability`] tracks the obligations an `fsync` has to cover, [`retry`]
@@ -42,7 +42,6 @@
 mod durability;
 mod endpoint;
 mod errors;
-mod flush;
 mod ops;
 mod receive;
 mod reconnect;
@@ -67,15 +66,18 @@ use kernel::{
     alloc::KBox, bindings, ffi, prelude::*, sync::aref::ARef, task::Task, time::msecs_to_jiffies,
 };
 
-use crate::protocol::{self, Qid, HEADER_SIZE};
+use crate::protocol::{self, HEADER_SIZE, Qid};
 
 use self::errors::not_connected_errno;
 use self::reconnect::bootstrap_connection;
 use self::session::Session;
-use self::tag_space::{FIRST_NORMAL_TAG, NORMAL_TAG_COUNT};
+use self::tag_space::TAG_COUNT;
 
 /// Smallest useful 9P message size accepted by this client.
 pub(crate) const MIN_MSIZE: u32 = 4096;
+
+const MAX_INFLIGHT_REQUESTS: usize = 1024;
+const _: () = assert!(MAX_INFLIGHT_REQUESTS < TAG_COUNT);
 
 /// Fid installed for the root during synchronous bootstrap.
 pub(crate) const ROOT_FID: u32 = 1;
@@ -93,31 +95,25 @@ pub(crate) const REBIND_CREDENTIAL_IDENTITY_WORDS: usize =
 /// Byte offset of an `Rread` payload inside its frame: header plus count.
 const READ_PAYLOAD_OFFSET: usize = HEADER_SIZE + mem::size_of::<u32>();
 
-/// Aggregate maximum response bytes reserved by in-flight requests.
-///
-/// This is accounting credit, not a preallocation. Small metadata requests can
-/// still occupy every default tag, while large reads share this 64-MiB ceiling
-/// instead of allowing `pending tags * msize` reply growth.
-const MAX_REPLY_CREDIT_BYTES: usize = 64 * 1024 * 1024;
-
 /// Persistent receive accumulator for small responses.
 ///
-/// Frames larger than this retain the direct-to-allocation path after their
+/// Larger frames take the response allocation attached to their tag after the
 /// buffered prefix, so a large negotiated msize does not permanently consume
-/// that much memory per mount.
+/// that much accumulator memory per mount.
 const RECEIVE_BATCH_BYTES: usize = 64 * 1024;
 
 /// Reusable allocation size for ordinary metadata replies.
 ///
 /// This covers every fixed metadata response, including a full ZeroFS stat.
-/// Variable walk, readlink, readdir and data replies spill to exact-sized
-/// allocations when their actual frame is larger.
+/// Variable walk, readlink, readdir and data replies use request-sized
+/// allocations when their maximum frame is larger.
 const SMALL_REPLY_BYTES: usize = 256;
 
 /// Per-mount buffers kept hot for concurrently owned metadata replies.
 ///
-/// The pool is deliberately independent of the pending-tag table: reply
-/// buffers are retained only for actual concurrent consumers.
+/// The pool is deliberately independent of the pending-tag table. A fixed hot
+/// set stays resident; concurrent requests beyond it allocate on demand and
+/// return compatible buffers as the pool has room.
 const SMALL_REPLY_BUFFERS: usize = 64;
 
 /// Largest request encoded without touching the allocator.
@@ -141,8 +137,8 @@ const _: () = assert!(
 const INITIAL_PENDING_TAGS: usize = 1024;
 const _: () = assert!(
     INITIAL_PENDING_TAGS >= 2
-        && INITIAL_PENDING_TAGS <= NORMAL_TAG_COUNT
-        && FIRST_NORMAL_TAG + NORMAL_TAG_COUNT == protocol::NOTAG as usize
+        && INITIAL_PENDING_TAGS <= TAG_COUNT
+        && TAG_COUNT == protocol::NOTAG as usize
 );
 
 /// Bound the fixed waiter set while the tag table grows.
@@ -164,14 +160,8 @@ const SLOT_SHARDS: usize = 64;
 /// pair with the server's result retention, not a client tuning knob.
 const MUTATION_RETRY_HORIZON_MS: u64 = protocol::retry::MUTATION_RETRY_HORIZON.as_millis() as u64;
 
-/// Maximum age of a decoded frame accepted as proof that a peer is alive.
-///
-/// Clamped below the reply timeout in [`Session::new`] so the evidence is
-/// always fresher than the wait that consumed it.
-const LIVENESS_WINDOW_MS: u64 = 3_000;
-
-/// Maximum liveness-probe extensions for one reply wait.
-const MAX_PROBE_EXTENSIONS: u32 = 7;
+/// Sentinel stored while no receiver-owned liveness probe has a tag.
+const NO_PROBE_TAG: u32 = u32::MAX;
 
 /// Most server addresses one mount will rotate through.
 ///
@@ -220,15 +210,6 @@ const MAX_LOCK_RECORDS: usize = 1024;
 
 /// Bytes in the per-mount lock owner identity: `zerofs-` plus a hex UUID.
 const CLIENT_ID_LEN: usize = 7 + 2 * 16;
-
-/// Inodes that may hold a distinct durability obligation at once.
-///
-/// Fixed at session creation because a mutation is recorded from netfslib
-/// writeback context, where a `GFP_KERNEL` allocation can enter reclaim and
-/// re-enter this filesystem, and the kernel allocator flags exposed to Rust
-/// have no `GFP_NOFS`. Overflow folds into the mount-wide obligation, which is
-/// more conservative, never less.
-const UNSYNCED_CAPACITY: usize = 256;
 
 const IO_TASK_NAME: &[u8] = b"zerofs-io\0";
 
@@ -306,10 +287,10 @@ impl Client {
         let negotiated_msize = bootstrapped.candidate.negotiated_msize;
         // Bootstrap needs a finite receive deadline because no request waiter
         // can retire a silent candidate. From here the session receiver owns
-        // the socket wait, while ordinary callers enforce response deadlines
-        // and shut the transport down when one expires.
+        // the socket wait, while ordinary callers detect connection-wide
+        // receive silence and retire the transport after a failed probe.
         bootstrapped.candidate.transport.set_blocking_receive()?;
-        let session = Session::new(endpoint, bootstrapped.candidate, MAX_REPLY_CREDIT_BYTES)?;
+        let session = Session::new(endpoint, bootstrapped.candidate)?;
         // Failing here drops the transport, so the server's connection guard
         // releases the root fid installed by the bootstrap Trebind.
         session.record_root_fid(ROOT_FID, credentials)?;
@@ -331,7 +312,7 @@ impl Client {
     }
 
     pub(crate) fn pending_tag_capacity(&self) -> usize {
-        self.session().slot_count()
+        self.session().slot_count().min(MAX_INFLIGHT_REQUESTS)
     }
 
     pub(crate) fn root_qid(&self) -> Qid {

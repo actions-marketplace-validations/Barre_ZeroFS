@@ -47,7 +47,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::net::{TcpStream, UnixStream};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 #[cfg(not(target_arch = "wasm32"))]
 use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, info, warn};
@@ -60,6 +60,9 @@ mod web_transport;
 
 /// The 9P "no tag" sentinel. We never allocate it for a normal request.
 const NOTAG: u16 = 0xFFFF;
+/// Filesystem RPCs admitted concurrently by one client.
+const MAX_INFLIGHT_REQUESTS: usize = 1024;
+const _: () = assert!(MAX_INFLIGHT_REQUESTS < NOTAG as usize);
 /// Default TCP port used when a target omits one.
 #[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_9P_PORT: u16 = 5564;
@@ -70,15 +73,8 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_millis(500);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Reply timeout before liveness checks begin.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
-/// Maximum age of a decoded frame accepted as proof of liveness.
-const LIVENESS_WINDOW: Duration = Duration::from_secs(3);
-/// Additional reply windows allowed while the connection remains live.
-const MAX_LIVENESS_EXTRA_WINDOWS: u32 = 7;
-
-const _: () = assert!(
-    LIVENESS_WINDOW.as_nanos() < REQUEST_TIMEOUT.as_nanos(),
-    "the liveness window must be shorter than the request timeout"
-);
+/// Sentinel stored while no receiver-owned liveness probe has a tag.
+const NO_LIVENESS_PROBE_TAG: u32 = u32::MAX;
 
 /// FIRST/RETRY state for one request future.
 #[derive(Default)]
@@ -411,7 +407,7 @@ mod target_parse_tests {
 /// One transport and its reader/writer tasks.
 struct Conn {
     writer_tx: mpsc::Sender<Vec<u8>>,
-    pending: DashMap<u16, oneshot::Sender<Bytes>>,
+    pending: DashMap<u16, PendingRequest>,
     tag_ctr: AtomicU16,
     /// Durability lineage returned by `Tgetlineage`.
     lineage_token: AtomicU64,
@@ -419,10 +415,13 @@ struct Conn {
     writer_epoch: AtomicU64,
     /// Set by whichever of the reader/writer tasks first sees the socket fail.
     dead: AtomicBool,
-    /// Monotonic base for [`Conn::last_alive`].
-    base: runtime::Clock,
-    /// Milliseconds since `base` when the last frame was decoded.
-    last_alive: AtomicU64,
+    /// Number of complete framed replies received on this stream.
+    ///
+    /// A request snapshots this counter at the start of each reply window.
+    /// Progress on any tag proves the shared byte stream is still moving.
+    receive_generation: AtomicU64,
+    /// Tag retained until the one outstanding Tgetlineage response is drained.
+    liveness_probe_tag: AtomicU32,
     /// Serializes explicit liveness probes.
     probe_lock: tokio::sync::Mutex<()>,
     /// Signals the (possibly idle) writer task to stop when the reader exits.
@@ -432,40 +431,40 @@ struct Conn {
     counters: Arc<TrafficCounters>,
 }
 
+type AdmissionPermit = Arc<OwnedSemaphorePermit>;
+
+/// Response routing state retained until delivery or connection teardown.
+/// A dispatched request keeps its admission permit here so cancelling its
+/// future cannot release capacity while the reply remains unresolved.
+struct PendingRequest {
+    reply: oneshot::Sender<Bytes>,
+    _admission: Option<AdmissionPermit>,
+}
+
 impl Conn {
     /// Stops both transport tasks.
     fn shutdown(&self) {
         self.dead.store(true, Ordering::Release);
+        self.liveness_probe_tag
+            .store(NO_LIVENESS_PROBE_TAG, Ordering::Release);
         self.pending.clear();
         self.reader_shutdown.notify_one();
         self.writer_shutdown.notify_one();
     }
 
-    /// Records receipt of a frame.
-    fn mark_alive(&self) {
-        self.last_alive
-            .store(self.base.elapsed_millis(), Ordering::Relaxed);
+    /// Records receipt of one complete framed reply.
+    fn note_received_frame(&self) {
+        self.receive_generation.fetch_add(1, Ordering::Release);
     }
 
-    /// Saturating strict-window comparison.
-    fn within(now_ms: u64, last_ms: u64, window: Duration) -> bool {
-        now_ms.saturating_sub(last_ms) < window.as_millis() as u64
-    }
-
-    /// Whether a frame was decoded within `window`.
-    fn heard_within(&self, window: Duration) -> bool {
-        Self::within(
-            self.base.elapsed_millis(),
-            self.last_alive.load(Ordering::Relaxed),
-            window,
-        )
+    fn receive_generation(&self) -> u64 {
+        self.receive_generation.load(Ordering::Acquire)
     }
 
     fn deliver(&self, frame: Bytes) {
         self.counters
             .bytes_received
             .fetch_add(frame.len() as u64, Ordering::Relaxed);
-        self.mark_alive();
         if frame.len() < P9_HEADER_SIZE {
             warn!(
                 "9P client: response frame too short ({} bytes)",
@@ -473,9 +472,16 @@ impl Conn {
             );
             return;
         }
+        self.note_received_frame();
         let tag = u16::from_le_bytes([frame[5], frame[6]]);
+        let _ = self.liveness_probe_tag.compare_exchange(
+            u32::from(tag),
+            NO_LIVENESS_PROBE_TAG,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         if let Some((_, pending)) = self.pending.remove(&tag) {
-            let _ = pending.send(frame);
+            let _ = pending.reply.send(frame);
         } else {
             debug!("9P client: response for unknown tag {tag}");
         }
@@ -578,12 +584,15 @@ pub struct NinePClient {
     stale_fids: DashSet<u32>,
     /// Orders stateful response settlement against snapshot/replay/install.
     session_transition: tokio::sync::Mutex<()>,
-    /// Per-fid durability obligations carried across reconnects.
-    unsynced: DashMap<u32, Unsynced>,
+    /// Dispatch window for filesystem RPCs. Session-maintenance exchanges use
+    /// the raw request path and do not consume permits.
+    request_admission: Arc<Semaphore>,
+    /// Per-inode durability obligations carried across reconnects.
+    unsynced: DashMap<u64, Unsynced>,
     counters: Arc<TrafficCounters>,
 }
 
-/// One fid's durability obligation. `generation` prevents an fsync from clearing
+/// One inode's durability obligation. `generation` prevents an fsync from clearing
 /// a concurrent write. `reported` keeps `ESTALE` visible until a replacement write.
 #[derive(Default)]
 struct Unsynced {
@@ -592,12 +601,29 @@ struct Unsynced {
     reported: bool,
 }
 
+#[derive(Clone, Copy)]
+enum FsyncScope {
+    Inode(u64),
+    All,
+}
+
+impl FsyncScope {
+    fn wire_flag(self) -> u32 {
+        match self {
+            Self::Inode(_) => P9_FSYNC_INODE,
+            Self::All => 0,
+        }
+    }
+}
+
 impl Unsynced {
     /// Records a write, preserving the oldest unreported lineage token.
     fn note(&mut self, token: u64) {
-        if self.reported || self.oldest.is_none() {
+        if self.reported {
             self.oldest = Some(token);
             self.reported = false;
+        } else {
+            self.oldest = Some(self.oldest.map_or(token, |oldest| oldest.min(token)));
         }
         self.generation = self.generation.wrapping_add(1);
     }
@@ -689,6 +715,7 @@ impl NinePClient {
             state: Mutex::new(SessionState::default()),
             stale_fids: DashSet::new(),
             session_transition: tokio::sync::Mutex::new(()),
+            request_admission: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
             unsynced: DashMap::new(),
             counters,
         });
@@ -714,8 +741,8 @@ impl NinePClient {
             lineage_token: AtomicU64::new(0),
             writer_epoch: AtomicU64::new(0),
             dead: AtomicBool::new(false),
-            base: runtime::Clock::now(),
-            last_alive: AtomicU64::new(0),
+            receive_generation: AtomicU64::new(0),
+            liveness_probe_tag: AtomicU32::new(NO_LIVENESS_PROBE_TAG),
             probe_lock: tokio::sync::Mutex::new(()),
             writer_shutdown: Notify::new(),
             reader_shutdown: Notify::new(),
@@ -858,7 +885,7 @@ impl NinePClient {
                         Ok(()) => {
                             this.live.store(true, Ordering::Release);
                             this.live_notify.notify_waiters();
-                            info!("9P session reconnected and restored");
+                            info!("9P session reconnected; replay complete");
                             break;
                         }
                         Err(e) => {
@@ -1195,35 +1222,69 @@ impl NinePClient {
         }
     }
 
-    /// Records an acknowledged mutation under its connection lineage.
-    fn note_unsynced(&self, fid: u32, token: u64) {
-        self.unsynced.entry(fid).or_default().note(token);
+    /// Resolve every inode a mutation will make responsible for durability.
+    ///
+    /// This runs before dispatch, while state still describes the request's
+    /// input fids. That matters for `Tlcreate`, which changes its fid from the
+    /// parent directory to the new child after the reply.
+    fn mutation_inodes(&self, body: &Message) -> ClientResult<Vec<u64>> {
+        if !body.is_mutation() {
+            return Ok(Vec::new());
+        }
+        self.validate_fids(body.durability_fids())?;
+        let state = self.state.lock().unwrap();
+        let mut inodes = Vec::with_capacity(2);
+        for fid in body.durability_fids() {
+            let inode = state
+                .fids
+                .get(&fid)
+                .map(|record| record.inode_id)
+                .ok_or(ClientError::Errno(linux::EBADF))?;
+            if !inodes.contains(&inode) {
+                inodes.push(inode);
+            }
+        }
+        Ok(inodes)
     }
 
-    /// Snapshot `(oldest token, generation)` of `fid` for a verified fsync.
-    fn snapshot_unsynced(&self, fid: u32) -> (Option<u64>, u64) {
-        self.unsynced.get(&fid).map_or((None, 0), |u| u.snapshot())
+    /// Records an acknowledged mutation under its connection lineage.
+    fn note_unsynced(&self, inode: u64, token: u64) {
+        self.unsynced.entry(inode).or_default().note(token);
+    }
+
+    /// Resolve a live fid to the stable inode identity used for durability.
+    fn fid_inode(&self, fid: u32) -> ClientResult<u64> {
+        self.validate_fids([fid])?;
+        self.state
+            .lock()
+            .unwrap()
+            .fids
+            .get(&fid)
+            .map(|record| record.inode_id)
+            .ok_or(ClientError::Errno(linux::EBADF))
+    }
+
+    /// Snapshot `(oldest token, generation)` of `inode` for a verified fsync.
+    fn snapshot_unsynced(&self, inode: u64) -> (Option<u64>, u64) {
+        self.unsynced
+            .get(&inode)
+            .map_or((None, 0), |u| u.snapshot())
     }
 
     /// Clears an unchanged obligation after verified fsync. `remove_if` rechecks
     /// under the shard lock before deleting the empty entry.
-    fn clear_unsynced_if_unchanged(&self, fid: u32, generation: u64) {
-        if let Some(mut u) = self.unsynced.get_mut(&fid) {
+    fn clear_unsynced_if_unchanged(&self, inode: u64, generation: u64) {
+        if let Some(mut u) = self.unsynced.get_mut(&inode) {
             u.clear_if_unchanged(generation);
         }
-        self.unsynced.remove_if(&fid, |_, u| u.oldest.is_none());
+        self.unsynced.remove_if(&inode, |_, u| u.oldest.is_none());
     }
 
     /// Marks an unchanged obligation reported after `ESTALE`.
-    fn report_unsynced_if_unchanged(&self, fid: u32, generation: u64) {
-        if let Some(mut u) = self.unsynced.get_mut(&fid) {
+    fn report_unsynced_if_unchanged(&self, inode: u64, generation: u64) {
+        if let Some(mut u) = self.unsynced.get_mut(&inode) {
             u.report_if_unchanged(generation);
         }
-    }
-
-    /// Removes durability state before a fid number is reused.
-    fn forget_unsynced(&self, fid: u32) {
-        self.unsynced.remove(&fid);
     }
 
     /// Maximum data a single Tread/Treaddir response (Rread/Rreaddir) can carry
@@ -1252,7 +1313,6 @@ impl NinePClient {
 
     /// Return a fid to the free list. The caller must have clunked it already.
     pub fn free_fid(&self, fid: u32) {
-        self.forget_unsynced(fid);
         self.stale_fids.remove(&fid);
         self.fid_free.lock().unwrap().push(fid);
     }
@@ -1309,10 +1369,14 @@ impl NinePClient {
         conn: &Conn,
         tag: u16,
         tx: oneshot::Sender<Bytes>,
+        admission: Option<AdmissionPermit>,
     ) -> Result<u16, oneshot::Sender<Bytes>> {
         match conn.pending.entry(tag) {
             Entry::Vacant(slot) => {
-                slot.insert(tx);
+                slot.insert(PendingRequest {
+                    reply: tx,
+                    _admission: admission,
+                });
                 Ok(tag)
             }
             Entry::Occupied(_) => Err(tx),
@@ -1323,6 +1387,7 @@ impl NinePClient {
     fn alloc_tag(
         conn: &Conn,
         mut tx: oneshot::Sender<Bytes>,
+        admission: Option<&AdmissionPermit>,
     ) -> Result<u16, oneshot::Sender<Bytes>> {
         // Scan all 65,535 usable tags, including a cycle starting at NOTAG.
         for _ in 0..=usize::from(NOTAG) {
@@ -1330,7 +1395,7 @@ impl NinePClient {
             if candidate == NOTAG {
                 continue;
             }
-            match Self::register_tag(conn, candidate, tx) {
+            match Self::register_tag(conn, candidate, tx, admission.cloned()) {
                 Ok(tag) => return Ok(tag),
                 Err(returned) => tx = returned,
             }
@@ -1345,7 +1410,12 @@ impl NinePClient {
         body: &Message,
         attempt: &mut OpAttemptState,
         stateful_dispatched_conn: Option<&Mutex<Option<Arc<Conn>>>>,
+        admission: &AdmissionPermit,
     ) -> ClientResult<(Message, Arc<Conn>)> {
+        // Resolve before anything reaches the wire. Successful stateful
+        // mutations may change a fid's binding before their public method
+        // settles the response into replay state.
+        let mutation_inodes = self.mutation_inodes(body)?;
         'resend: loop {
             self.validate_fids(body.request_fids())?;
             await_resend_bounded(attempt, self.wait_until_live()).await??;
@@ -1370,7 +1440,7 @@ impl NinePClient {
             }
 
             let (otx, mut orx) = oneshot::channel();
-            let tag = match Self::alloc_tag(&conn, otx) {
+            let tag = match Self::alloc_tag(&conn, otx, Some(admission)) {
                 Ok(tag) => tag,
                 Err(_) => {
                     // Teardown clears live and quarantined tags.
@@ -1417,8 +1487,9 @@ impl NinePClient {
                     permit.send(bytes);
                     Ok(())
                 })?;
-            // Preserve the in-flight request while bounded liveness checks succeed.
-            let mut extra_windows = 0u32;
+            // A later reply on this TCP stream proves that this request's
+            // response was not lost; it may still be queued or executing.
+            let mut observed_receive_generation = conn.receive_generation();
             let frame = loop {
                 match runtime::timeout(REQUEST_TIMEOUT, &mut orx).await {
                     Ok(Ok(frame)) => break frame,
@@ -1428,10 +1499,13 @@ impl NinePClient {
                         continue 'resend;
                     }
                     Err(_) => {
-                        if extra_windows < MAX_LIVENESS_EXTRA_WINDOWS
-                            && Self::conn_alive(&conn).await
-                        {
-                            extra_windows += 1;
+                        let current_generation = conn.receive_generation();
+                        if current_generation != observed_receive_generation {
+                            observed_receive_generation = current_generation;
+                            continue;
+                        }
+                        if Self::probe_connection(&conn, current_generation).await {
+                            observed_receive_generation = conn.receive_generation();
                             continue;
                         }
                         self.force_reprobe(&conn);
@@ -1457,26 +1531,36 @@ impl NinePClient {
                 runtime::yield_now().await;
                 continue;
             }
-            // Successful mutations create per-fid durability obligations.
+            // Successful mutations create per-inode durability obligations.
             if !matches!(msg.body, Message::Rlerror(_)) {
                 let token = conn.lineage_token.load(Ordering::Relaxed);
-                for fid in body.durability_fids() {
-                    self.note_unsynced(fid, token);
+                for &inode in &mutation_inodes {
+                    self.note_unsynced(inode, token);
                 }
             }
             return Ok((msg.body, conn));
         }
     }
 
+    async fn acquire_request_admission(&self) -> ClientResult<AdmissionPermit> {
+        Ok(Arc::new(
+            Arc::clone(&self.request_admission)
+                .acquire_owned()
+                .await
+                .map_err(|_| ClientError::Disconnected)?,
+        ))
+    }
+
     /// Request path for operations that do not change replayable session state.
     async fn send_request(&self, body: Message) -> ClientResult<Message> {
+        let admission = self.acquire_request_admission().await?;
         let op_id = if body.is_mutation() {
             Uuid::new_v4().into_bytes()
         } else {
             [0u8; 16]
         };
         let mut attempt = OpAttemptState::default();
-        self.send_request_on_current(op_id, &body, &mut attempt, None)
+        self.send_request_on_current(op_id, &body, &mut attempt, None, &admission)
             .await
             .map(|(response, _)| response)
     }
@@ -1504,6 +1588,7 @@ impl NinePClient {
         &self,
         body: Message,
     ) -> ClientResult<(Message, tokio::sync::MutexGuard<'_, ()>)> {
+        let admission = self.acquire_request_admission().await?;
         let op_id = if body.is_mutation() {
             Uuid::new_v4().into_bytes()
         } else {
@@ -1518,7 +1603,13 @@ impl NinePClient {
         };
         let result = loop {
             let (response, response_conn) = match self
-                .send_request_on_current(op_id, &body, &mut attempt, Some(&dispatched_conn))
+                .send_request_on_current(
+                    op_id,
+                    &body,
+                    &mut attempt,
+                    Some(&dispatched_conn),
+                    &admission,
+                )
                 .await
             {
                 Ok(response) => response,
@@ -1544,25 +1635,49 @@ impl NinePClient {
         result
     }
 
-    /// Tests recent traffic, then performs a single-flight lease-gated probe.
-    async fn conn_alive(conn: &Conn) -> bool {
+    /// Rechecks global receive progress, then runs one lease-gated probe.
+    async fn probe_connection(conn: &Conn, observed_generation: u64) -> bool {
+        Self::probe_connection_with_timeout(conn, observed_generation, PROBE_TIMEOUT).await
+    }
+
+    async fn probe_connection_with_timeout(
+        conn: &Conn,
+        observed_generation: u64,
+        probe_timeout: Duration,
+    ) -> bool {
         if conn.dead.load(Ordering::Acquire) {
             return false;
         }
-        if conn.heard_within(LIVENESS_WINDOW) {
+        if conn.receive_generation() != observed_generation {
             return true;
         }
         let _guard = conn.probe_lock.lock().await;
         if conn.dead.load(Ordering::Acquire) {
             return false;
         }
-        if conn.heard_within(LIVENESS_WINDOW) {
+        if conn.receive_generation() != observed_generation {
             return true;
         }
-        matches!(
-            runtime::timeout(PROBE_TIMEOUT, query_lineage_token(conn)).await,
-            Ok(Ok(()))
-        )
+        // A previous probe whose response has not arrived is already the
+        // strongest request we can put on this stream. Do not accumulate
+        // another quarantined tag behind it.
+        if conn.liveness_probe_tag.load(Ordering::Acquire) != NO_LIVENESS_PROBE_TAG {
+            return false;
+        }
+        match runtime::timeout(probe_timeout, query_lineage_token(conn)).await {
+            Ok(Ok(())) => true,
+            // The probe uses the same response queue and stream as normal
+            // traffic. A response backlog can delay Rgetlineage past its own
+            // deadline while other valid frames still prove this connection
+            // is alive. The timed-out RPC keeps its dispatched registration
+            // until its late reply is drained, so accepting that passive
+            // evidence neither reuses its tag nor desynchronizes the stream.
+            Err(_) => {
+                !conn.dead.load(Ordering::Acquire)
+                    && conn.receive_generation() != observed_generation
+            }
+            Ok(Err(_)) => false,
+        }
     }
 
     /// Tears down `conn` and wakes the reconnect supervisor.
@@ -1574,7 +1689,8 @@ impl NinePClient {
     /// A one-shot send on a specific connection, bypassing the live-gate and
     /// state recording. Used during reconnect to replay the session.
     async fn send_raw(conn: &Conn, body: Message) -> ClientResult<Message> {
-        Self::send_raw_at_tag(conn, None, body).await
+        let track_liveness_probe = matches!(&body, Message::Tgetlineage(_));
+        Self::send_raw_at_tag(conn, None, body, track_liveness_probe).await
     }
 
     /// Sends on a specific connection with an allocated or exact tag.
@@ -1582,6 +1698,7 @@ impl NinePClient {
         conn: &Conn,
         exact_tag: Option<u16>,
         body: Message,
+        track_liveness_probe: bool,
     ) -> ClientResult<Message> {
         let permit = conn
             .writer_tx
@@ -1594,9 +1711,9 @@ impl NinePClient {
         }
         let (otx, orx) = oneshot::channel();
         let tag = match exact_tag {
-            Some(tag) => Self::register_tag(conn, tag, otx)
+            Some(tag) => Self::register_tag(conn, tag, otx, None)
                 .map_err(|_| ClientError::Unexpected("raw tag already registered"))?,
-            None => match Self::alloc_tag(conn, otx) {
+            None => match Self::alloc_tag(conn, otx, None) {
                 Ok(tag) => tag,
                 Err(_) => {
                     drop(permit);
@@ -1618,6 +1735,19 @@ impl NinePClient {
             Ok(b) => b,
             Err(e) => return Err(ClientError::Codec(e)),
         };
+        if track_liveness_probe
+            && conn
+                .liveness_probe_tag
+                .compare_exchange(
+                    NO_LIVENESS_PROBE_TAG,
+                    u32::from(tag),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return Err(ClientError::Unexpected("liveness probe already pending"));
+        }
         pending.mark_dispatched();
         permit.send(bytes);
         let frame = orx.await.map_err(|_| ClientError::Disconnected)?;
@@ -2518,39 +2648,47 @@ impl NinePClient {
         }
     }
 
-    /// Verifies fsync for all fids associated with one inode. `primary` carries
-    /// `Tfsyncdur`; the oldest recorded lineage token determines the result.
-    pub async fn fsync_inode(&self, fids: &[u32], primary: u32, datasync: u32) -> ClientResult<()> {
-        self.validate_fids(fids.iter().copied())?;
+    async fn fsync_scope(&self, primary: u32, scope: FsyncScope) -> ClientResult<()> {
+        self.validate_fids([primary])?;
         // Generations prevent the result from clearing writes concurrent with fsync.
         let mut token: Option<u64> = None;
-        let mut snaps: Vec<(u32, u64)> = Vec::with_capacity(fids.len());
-        for &fid in fids {
-            let (oldest, generation) = self.snapshot_unsynced(fid);
-            if let Some(t) = oldest {
-                token = Some(token.map_or(t, |w| w.min(t)));
+        let mut snaps: Vec<(u64, u64)> = Vec::new();
+        match scope {
+            FsyncScope::Inode(inode) => {
+                let (oldest, generation) = self.snapshot_unsynced(inode);
+                token = oldest;
+                snaps.push((inode, generation));
             }
-            snaps.push((fid, generation));
+            FsyncScope::All => {
+                for entry in &self.unsynced {
+                    let inode = *entry.key();
+                    let (oldest, generation) = entry.snapshot();
+                    if let Some(t) = oldest {
+                        token = Some(token.map_or(t, |current| current.min(t)));
+                    }
+                    snaps.push((inode, generation));
+                }
+            }
         }
         match self
             .rpc(Message::Tfsyncdur(Tfsyncdur {
                 fid: primary,
-                datasync,
+                datasync: scope.wire_flag(),
                 token: token.unwrap_or(0),
             }))
             .await
         {
             Ok(Message::Rfsync(_)) => {
-                for (fid, generation) in snaps {
-                    self.clear_unsynced_if_unchanged(fid, generation);
+                for (inode, generation) in snaps {
+                    self.clear_unsynced_if_unchanged(inode, generation);
                 }
                 Ok(())
             }
             Ok(_) => Err(ClientError::Unexpected("fsync")),
             Err(ClientError::Errno(e)) if e == linux::ESTALE => {
                 // Preserve stale obligations until replacement writes arrive.
-                for (fid, generation) in snaps {
-                    self.report_unsynced_if_unchanged(fid, generation);
+                for (inode, generation) in snaps {
+                    self.report_unsynced_if_unchanged(inode, generation);
                 }
                 Err(ClientError::Errno(e))
             }
@@ -2558,21 +2696,15 @@ impl NinePClient {
         }
     }
 
-    /// Verified fsync for one fid. Multi-fid inode users call [`Self::fsync_inode`].
-    pub async fn fsync(&self, fid: u32, datasync: u32) -> ClientResult<()> {
-        self.fsync_inode(&[fid], fid, datasync).await
+    /// Verified fsync for the inode named by `fid`, across every handle.
+    pub async fn fsync(&self, fid: u32) -> ClientResult<()> {
+        let inode = self.fid_inode(fid)?;
+        self.fsync_scope(fid, FsyncScope::Inode(inode)).await
     }
 
     /// Filesystem-wide barrier for this client's outstanding durability obligations.
-    pub async fn fsync_all(&self, primary: u32, datasync: u32) -> ClientResult<()> {
-        let mut fids = vec![primary];
-        for entry in &self.unsynced {
-            let fid = *entry.key();
-            if fid != primary {
-                fids.push(fid);
-            }
-        }
-        self.fsync_inode(&fids, primary, datasync).await
+    pub async fn fsync_all(&self, primary: u32) -> ClientResult<()> {
+        self.fsync_scope(primary, FsyncScope::All).await
     }
 
     pub async fn statfs(&self, fid: u32) -> ClientResult<Rstatfs> {
@@ -2897,6 +3029,7 @@ async fn version_on(conn: &Conn, requested: u32) -> ClientResult<u32> {
             msize: requested,
             version: P9String::new(VERSION_9P2000L_ZEROFS.to_vec()),
         }),
+        false,
     )
     .await?
     {
@@ -3084,7 +3217,13 @@ mod lock_range_tests {
 
 #[cfg(test)]
 mod durability_tracking_tests {
-    use super::Unsynced;
+    use super::{FsyncScope, P9_FSYNC_INODE, Unsynced};
+
+    #[test]
+    fn fsync_scope_owns_the_wire_scope_bit() {
+        assert_eq!(FsyncScope::All.wire_flag(), 0);
+        assert_eq!(FsyncScope::Inode(7).wire_flag(), P9_FSYNC_INODE);
+    }
 
     #[test]
     fn fsync_clears_the_obligation_when_quiescent() {
@@ -3097,7 +3236,7 @@ mod durability_tracking_tests {
     }
 
     #[test]
-    fn a_repeated_fsync_on_one_fid_keeps_failing_until_a_redo() {
+    fn a_repeated_fsync_on_one_inode_keeps_failing_until_a_redo() {
         let mut u = Unsynced::default();
         u.note(1);
         let (oldest, generation) = u.snapshot();
@@ -3120,7 +3259,7 @@ mod durability_tracking_tests {
     }
 
     #[test]
-    fn an_estale_and_redo_on_one_fid_does_not_discharge_a_sibling_fid() {
+    fn an_estale_and_redo_on_one_inode_does_not_discharge_a_sibling_inode() {
         use std::collections::HashMap;
         let mut map: HashMap<u32, Unsynced> = HashMap::new();
         map.entry(10).or_default().note(1);
@@ -3136,7 +3275,7 @@ mod durability_tracking_tests {
         assert_eq!(
             map.get(&20).unwrap().snapshot().0,
             Some(1),
-            "fid 10's ESTALE+redo+success cycle must not touch fid 20"
+            "inode 10's ESTALE+redo+success cycle must not touch inode 20"
         );
     }
 
@@ -3157,8 +3296,8 @@ mod durability_tracking_tests {
     #[test]
     fn oldest_token_is_kept_across_a_lineage_change() {
         let mut u = Unsynced::default();
-        u.note(5);
         u.note(9);
+        u.note(5);
         assert_eq!(u.snapshot().0, Some(5), "the oldest (riskiest) token wins");
     }
 
@@ -3179,8 +3318,8 @@ fn test_conn_with_receiver() -> (Arc<Conn>, mpsc::Receiver<Vec<u8>>) {
         lineage_token: AtomicU64::new(0),
         writer_epoch: AtomicU64::new(0),
         dead: AtomicBool::new(false),
-        base: runtime::Clock::now(),
-        last_alive: AtomicU64::new(0),
+        receive_generation: AtomicU64::new(0),
+        liveness_probe_tag: AtomicU32::new(NO_LIVENESS_PROBE_TAG),
         probe_lock: tokio::sync::Mutex::new(()),
         writer_shutdown: Notify::new(),
         reader_shutdown: Notify::new(),
@@ -3202,6 +3341,10 @@ mod session_transition_tests {
     }
 
     fn test_client(conn: Arc<Conn>) -> Arc<NinePClient> {
+        test_client_with_limit(conn, MAX_INFLIGHT_REQUESTS)
+    }
+
+    fn test_client_with_limit(conn: Arc<Conn>, max_inflight_requests: usize) -> Arc<NinePClient> {
         Arc::new(NinePClient {
             targets: Vec::new(),
             conn: ArcSwap::new(conn),
@@ -3216,9 +3359,56 @@ mod session_transition_tests {
             state: Mutex::new(SessionState::default()),
             stale_fids: DashSet::new(),
             session_transition: tokio::sync::Mutex::new(()),
+            request_admission: Arc::new(Semaphore::new(max_inflight_requests)),
             unsynced: DashMap::new(),
             counters: Arc::new(TrafficCounters::default()),
         })
+    }
+
+    fn track_test_fid(client: &NinePClient, fid: u32) {
+        client
+            .state
+            .lock()
+            .unwrap()
+            .fids
+            .insert(fid, inode_fid(u64::from(fid), 0, 0, None));
+    }
+
+    #[test]
+    fn mutation_obligations_are_derived_from_stable_inode_ids() {
+        let client = test_client(test_conn());
+        {
+            let mut state = client.state.lock().unwrap();
+            state.fids.insert(7, inode_fid(70, 0, 0, None));
+            state.fids.insert(8, inode_fid(80, 0, 0, None));
+        }
+        let rename = Message::Trenameat(Trenameat {
+            olddirfid: 7,
+            oldname: P9String::new(b"old".to_vec()),
+            newdirfid: 8,
+            newname: P9String::new(b"new".to_vec()),
+        });
+        assert_eq!(client.mutation_inodes(&rename).unwrap(), vec![80, 70]);
+
+        client
+            .state
+            .lock()
+            .unwrap()
+            .fids
+            .insert(8, inode_fid(70, 0, 0, None));
+        assert_eq!(
+            client.mutation_inodes(&rename).unwrap(),
+            vec![70],
+            "aliases of one inode must create one durability obligation"
+        );
+    }
+
+    #[test]
+    fn recycling_a_fid_does_not_discard_its_inode_obligation() {
+        let client = test_client(test_conn());
+        client.note_unsynced(70, 5);
+        client.free_fid(7);
+        assert_eq!(client.snapshot_unsynced(70).0, Some(5));
     }
 
     async fn next_request(requests: &mut TestRequests) -> Option<P9Message> {
@@ -4400,6 +4590,7 @@ mod session_transition_tests {
         let (old_conn, mut old_requests) = test_conn_with_receiver();
         old_conn.writer_epoch.store(7, Ordering::Relaxed);
         let client = test_client(Arc::clone(&old_conn));
+        track_test_fid(&client, 7);
 
         let request_client = Arc::clone(&client);
         let request = tokio::spawn(async move { request_client.write(7, 0, b"x").await });
@@ -4468,6 +4659,7 @@ mod session_transition_tests {
     async fn write_bytes_chunks_at_the_msize_boundary() {
         let (conn, mut requests) = test_conn_with_receiver();
         let client = test_client(Arc::clone(&conn));
+        track_test_fid(&client, 7);
         let max = client.max_write_payload();
         assert_eq!(
             max,
@@ -4532,6 +4724,7 @@ mod session_transition_tests {
     async fn write_chunk_rejects_a_count_larger_than_attempted() {
         let (conn, mut requests) = test_conn_with_receiver();
         let client = test_client(Arc::clone(&conn));
+        track_test_fid(&client, 7);
 
         let request_client = Arc::clone(&client);
         let request = tokio::spawn(async move {
@@ -4556,6 +4749,7 @@ mod session_transition_tests {
     async fn ambiguous_reply_loss_marks_the_next_frame_as_retry() {
         let (conn, mut requests) = test_conn_with_receiver();
         let client = test_client(Arc::clone(&conn));
+        track_test_fid(&client, 7);
 
         let responder_conn = Arc::clone(&conn);
         let responder = tokio::spawn(async move {
@@ -4689,6 +4883,7 @@ mod session_transition_tests {
             .await
             .expect("test writer queue should accept its first frame");
         let client = test_client(Arc::clone(&conn));
+        track_test_fid(&client, 7);
         let request_client = Arc::clone(&client);
         let request = tokio::spawn(async move {
             request_client
@@ -4713,6 +4908,7 @@ mod session_transition_tests {
     async fn cancelling_a_dispatched_request_quarantines_its_tag() {
         let (conn, mut requests) = test_conn_with_receiver();
         let client = test_client(Arc::clone(&conn));
+        track_test_fid(&client, 7);
         let request_client = Arc::clone(&client);
         let request = tokio::spawn(async move { request_client.write(7, 0, b"x").await });
 
@@ -4761,6 +4957,7 @@ mod session_transition_tests {
             .expect("test writer queue should accept its first frame");
 
         let client = test_client(Arc::clone(&conn));
+        track_test_fid(&client, 7);
         let request_client = Arc::clone(&client);
         let request = tokio::spawn(async move { request_client.write(7, 0, b"x").await });
         for _ in 0..4 {
@@ -4776,12 +4973,143 @@ mod session_transition_tests {
         assert!(conn.pending.is_empty());
     }
 
+    #[tokio::test]
+    async fn admission_waits_locally_until_an_inflight_request_settles() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client_with_limit(Arc::clone(&conn), 1);
+        track_test_fid(&client, 7);
+
+        let first_client = Arc::clone(&client);
+        let first = tokio::spawn(async move { first_client.write(7, 0, b"a").await });
+        let first_request = recv_op_request(&mut requests, "first admitted request").await;
+        assert_eq!(client.request_admission.available_permits(), 0);
+
+        let second_client = Arc::clone(&client);
+        let second = tokio::spawn(async move { second_client.write(7, 1, b"b").await });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            requests.try_recv().is_err(),
+            "the next request must remain local while the permit is held"
+        );
+
+        reply(
+            &conn,
+            first_request.tag,
+            Message::Rwrite(Rwrite { count: 1 }),
+        );
+        assert_eq!(first.await.unwrap().unwrap(), 1);
+
+        let second_request = recv_op_request(&mut requests, "second admitted request").await;
+        reply(
+            &conn,
+            second_request.tag,
+            Message::Rwrite(Rwrite { count: 1 }),
+        );
+        assert_eq!(second.await.unwrap().unwrap(), 1);
+        assert_eq!(client.request_admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_retains_admission_while_its_tag_is_quarantined() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client_with_limit(Arc::clone(&conn), 1);
+        track_test_fid(&client, 7);
+
+        let first_client = Arc::clone(&client);
+        let first = tokio::spawn(async move { first_client.write(7, 0, b"a").await });
+        let first_request = recv_op_request(&mut requests, "first request").await;
+        first.abort();
+        let _ = first.await;
+        assert_eq!(client.request_admission.available_permits(), 0);
+
+        let second_client = Arc::clone(&client);
+        let second = tokio::spawn(async move { second_client.write(7, 1, b"b").await });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            requests.try_recv().is_err(),
+            "cancellation must not release capacity while the reply remains unresolved"
+        );
+
+        // Delivery removes the abandoned registration. Its retained permit is
+        // then released even though the response receiver no longer exists.
+        reply(
+            &conn,
+            first_request.tag,
+            Message::Rwrite(Rwrite { count: 1 }),
+        );
+        let second_request = recv_op_request(&mut requests, "second request").await;
+        reply(
+            &conn,
+            second_request.tag,
+            Message::Rwrite(Rwrite { count: 1 }),
+        );
+        assert_eq!(second.await.unwrap().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconnect_resend_keeps_the_original_admission_permit() {
+        let (old_conn, mut old_requests) = test_conn_with_receiver();
+        let client = test_client_with_limit(Arc::clone(&old_conn), 1);
+        track_test_fid(&client, 7);
+
+        let first_client = Arc::clone(&client);
+        let first = tokio::spawn(async move { first_client.write(7, 0, b"a").await });
+        let first_request = recv_op_request(&mut old_requests, "first request").await;
+        assert!(matches!(
+            first_request.body,
+            Message::Twrite(Twrite { offset: 0, .. })
+        ));
+
+        let second_client = Arc::clone(&client);
+        let second = tokio::spawn(async move { second_client.write(7, 1, b"b").await });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(old_requests.try_recv().is_err());
+
+        client.live.store(false, Ordering::Release);
+        old_conn.connection_lost(&client.reconnect_notify);
+        let (new_conn, mut new_requests) = test_conn_with_receiver();
+        client.conn.store(Arc::clone(&new_conn));
+        client.live.store(true, Ordering::Release);
+        client.live_notify.notify_waiters();
+
+        let resent = recv_op_request(&mut new_requests, "resent first request").await;
+        assert!(matches!(
+            resent.body,
+            Message::Twrite(Twrite { offset: 0, .. })
+        ));
+        assert!(
+            new_requests.try_recv().is_err(),
+            "a resend must retain its permit instead of admitting another operation"
+        );
+
+        reply(&new_conn, resent.tag, Message::Rwrite(Rwrite { count: 1 }));
+        assert_eq!(first.await.unwrap().unwrap(), 1);
+
+        let second_request = recv_op_request(&mut new_requests, "second request").await;
+        assert!(matches!(
+            second_request.body,
+            Message::Twrite(Twrite { offset: 1, .. })
+        ));
+        reply(
+            &new_conn,
+            second_request.tag,
+            Message::Rwrite(Rwrite { count: 1 }),
+        );
+        assert_eq!(second.await.unwrap().unwrap(), 1);
+    }
+
     #[test]
     fn undispatched_guard_releases_its_tag() {
         let conn = test_conn();
 
         let (tx, _rx) = oneshot::channel();
-        let tag = NinePClient::alloc_tag(&conn, tx).expect("tag allocation failed");
+        let tag = NinePClient::alloc_tag(&conn, tx, None).expect("tag allocation failed");
         let guard = PendingTag {
             conn: Arc::clone(&conn),
             tag,
@@ -4798,12 +5126,13 @@ mod session_transition_tests {
 
         for tag in 0..(NOTAG - 1) {
             let (tx, _rx) = oneshot::channel();
-            assert!(NinePClient::register_tag(&conn, tag, tx).is_ok());
+            assert!(NinePClient::register_tag(&conn, tag, tx, None).is_ok());
         }
         conn.tag_ctr.store(NOTAG, Ordering::Relaxed);
 
         let (tx, _rx) = oneshot::channel();
-        let tag = NinePClient::alloc_tag(&conn, tx).expect("allocator missed the last usable tag");
+        let tag =
+            NinePClient::alloc_tag(&conn, tx, None).expect("allocator missed the last usable tag");
         assert_eq!(tag, NOTAG - 1);
     }
 }
@@ -4817,23 +5146,103 @@ mod liveness_tests {
     }
 
     #[test]
-    fn within_is_strict_and_saturates() {
-        let w = Duration::from_millis(300);
-        assert!(Conn::within(1000, 800, w), "200ms ago is within 300ms");
-        assert!(
-            !Conn::within(1000, 700, w),
-            "exactly at the window is NOT within (strict <)"
+    fn valid_frames_advance_connection_progress() {
+        let conn = test_conn();
+        assert_eq!(conn.receive_generation(), 0);
+        conn.deliver(
+            P9Message::new(17, Message::Rflush(Rflush))
+                .to_bytes()
+                .unwrap()
+                .into(),
         );
-        assert!(!Conn::within(1000, 500, w), "500ms ago is past 300ms");
-        assert!(Conn::within(500, 1000, w));
+        assert_eq!(conn.receive_generation(), 1);
     }
 
     #[test]
-    fn a_just_marked_conn_is_heard() {
+    fn malformed_frames_do_not_prove_liveness() {
         let conn = test_conn();
-        assert!(conn.heard_within(Duration::from_secs(60)));
-        conn.mark_alive();
-        assert!(conn.heard_within(Duration::from_secs(60)));
-        assert!(!conn.heard_within(Duration::from_millis(0)));
+        conn.deliver(Bytes::from_static(&[0; P9_HEADER_SIZE - 1]));
+        assert_eq!(conn.receive_generation(), 0);
+    }
+
+    fn response(tag: u16, body: Message) -> Bytes {
+        P9Message::new(tag, body).to_bytes().unwrap().into()
+    }
+
+    fn request_tag(frame: &[u8]) -> u16 {
+        u16::from_le_bytes([frame[5], frame[6]])
+    }
+
+    #[tokio::test]
+    async fn a_quiet_probe_timeout_does_not_claim_liveness() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let observed = conn.receive_generation();
+        let probe =
+            NinePClient::probe_connection_with_timeout(&conn, observed, Duration::from_millis(5));
+        let (alive, request) = tokio::join!(probe, requests.recv());
+        let request = request.expect("probe request");
+        let tag = request_tag(&request);
+
+        assert!(!alive);
+        assert!(conn.pending.contains_key(&tag));
+        assert!(
+            !NinePClient::probe_connection_with_timeout(
+                &conn,
+                conn.receive_generation(),
+                Duration::from_millis(5),
+            )
+            .await
+        );
+        assert!(
+            runtime::timeout(Duration::from_millis(1), requests.recv())
+                .await
+                .is_err(),
+            "an outstanding probe must suppress another probe"
+        );
+
+        conn.deliver(response(
+            tag,
+            Message::Rgetlineage(Rgetlineage {
+                token: 1,
+                writer_epoch: 1,
+            }),
+        ));
+        assert!(conn.pending.is_empty());
+        assert_eq!(
+            conn.liveness_probe_tag.load(Ordering::Acquire),
+            NO_LIVENESS_PROBE_TAG
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_reply_proves_a_probe_connection_is_moving() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let observed = conn.receive_generation();
+        let probe =
+            NinePClient::probe_connection_with_timeout(&conn, observed, Duration::from_millis(5));
+        let server = async {
+            let request = requests.recv().await.expect("probe request");
+            let tag = request_tag(&request);
+            let other_tag = if tag == 0 { 1 } else { 0 };
+            conn.deliver(response(other_tag, Message::Rflush(Rflush)));
+            tag
+        };
+        let (alive, tag) = tokio::join!(probe, server);
+
+        assert!(alive);
+        assert!(conn.pending.contains_key(&tag));
+
+        conn.deliver(response(
+            tag,
+            Message::Rgetlineage(Rgetlineage {
+                token: 1,
+                writer_epoch: 1,
+            }),
+        ));
+        assert!(conn.pending.is_empty());
+        assert_eq!(
+            conn.liveness_probe_tag.load(Ordering::Acquire),
+            NO_LIVENESS_PROBE_TAG
+        );
     }
 }

@@ -1,12 +1,13 @@
 use core::{
     pin::Pin,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 
 use kernel::{
     alloc::{KBox, KVVec, KVec, flags::GFP_KERNEL},
     bindings,
     bitmap::BitmapVec,
+    error::code::ERESTARTSYS,
     ffi, new_condvar, new_mutex,
     prelude::*,
     sync::{Arc, CondVar, CondVarTimeoutResult, Mutex},
@@ -15,17 +16,17 @@ use kernel::{
 
 use crate::{protocol::Rgetlineage, transport::SocketTransport};
 
-use super::durability::{OrphanUnsynced, UnsyncedEntry};
+use super::durability::UnsyncedEntry;
 use super::endpoint::Endpoint;
 use super::errors::{is_internal_restart_status, not_connected_errno};
 use super::receive::ReceiveState;
 use super::reconnect::ProbedCandidate;
 use super::registry::{CredentialSlot, FidSlot, LockRecord};
-use super::slots::{PendingSlot, PendingState};
+use super::signals::sleep_uninterruptible_tick;
+use super::slots::{PendingSlot, PendingState, vacate_slot};
 use super::{
-    CLIENT_ID_LEN, FIRST_NORMAL_TAG, INITIAL_PENDING_TAGS, LIVENESS_WINDOW_MS, MAX_REPLY_WAITERS,
-    NORMAL_TAG_COUNT, RECEIVE_BATCH_BYTES, ROOT_FID, SLOT_SHARDS, SMALL_REPLY_BUFFERS,
-    SMALL_REPLY_BYTES, UNSYNCED_CAPACITY, elapsed_ms, jiffies_for_ms, monotonic_ns,
+    CLIENT_ID_LEN, INITIAL_PENDING_TAGS, MAX_REPLY_WAITERS, NO_PROBE_TAG, RECEIVE_BATCH_BYTES,
+    ROOT_FID, SLOT_SHARDS, SMALL_REPLY_BUFFERS, SMALL_REPLY_BYTES, TAG_COUNT, jiffies_for_ms,
 };
 
 #[pin_data]
@@ -34,10 +35,6 @@ pub(super) struct Session {
     pub(super) timeout_jiffies: usize,
     /// Longest a request blocks waiting for reconnect and replay.
     pub(super) grace_ms: u64,
-    /// Age of a decoded frame still accepted as proof a peer is alive. This is
-    /// shorter than a reply deadline so only recent traffic extends that wait.
-    liveness_window_ms: u64,
-    pub(super) reply_credit_limit: usize,
     /// Lock owner identity sent with every `Tlock` and `Tgetlock`.
     ///
     /// Fixed for the mount because replay has to resend the same bytes, and
@@ -54,10 +51,16 @@ pub(super) struct Session {
     /// peer is re-probed on every reconnect round, so an unthrottled warning
     /// would be one log line per round forever.
     pub(super) msize_mismatch_warned: AtomicBool,
-    /// Monotonic nanoseconds when a frame was last decoded on any connection.
-    pub(super) last_frame_ns: AtomicU64,
+    /// Number of complete replies published on the installed connection.
+    ///
+    /// Ordinary request deadlines compare snapshots of this counter. Progress
+    /// on any tag proves the shared TCP stream is alive; one delayed tag does
+    /// not by itself justify retiring the connection.
+    pub(super) receive_generation: AtomicU64,
     /// Set while an in-band liveness probe is active.
     pub(super) probe_in_flight: AtomicBool,
+    /// Receiver-owned tag of the one outstanding liveness probe.
+    pub(super) liveness_probe_tag: AtomicU32,
     /// Lock-free mirror of `SessionState::connection_epoch`.
     ///
     /// A receiver checks this before and after taking a tag shard. Retirement
@@ -65,10 +68,6 @@ pub(super) struct Session {
     /// wins its tag lock and is published, or observes that its stream has
     /// already been retired.
     pub(super) active_epoch: AtomicU64,
-    /// Frames written to the current connection whose reply is not published
-    /// yet. Kept outside `state` because the receiver updates it for every
-    /// frame; Tflush is the only other reader or writer.
-    pub(super) sent_count: AtomicUsize,
     /// Outstanding registered reads whose payload cannot fit the accumulator.
     ///
     /// Nonzero means the next frame is likely a bulk read, so an empty
@@ -80,6 +79,12 @@ pub(super) struct Session {
     pub(super) bulk_reads: AtomicU32,
     #[pin]
     pub(super) send_lock: Mutex<()>,
+    /// Filesystem RPCs admitted by this mount. A permit remains held across
+    /// resends until the request settles.
+    #[pin]
+    request_in_flight: Mutex<usize>,
+    #[pin]
+    request_admission_changed: CondVar,
     #[pin]
     pub(super) receive: Mutex<ReceiveState>,
     /// Reusable frames for allocation-free metadata replies.
@@ -120,23 +125,21 @@ pub(super) struct SessionState {
     /// published so termination can shut it down instead of waiting it out.
     pub(super) candidate: Option<Arc<SocketTransport>>,
     /// Bumped whenever the tag namespace is invalidated, which is exactly when
-    /// a connection is retired. A reply, a failure or a Tflush that names an
-    /// older epoch belongs to a connection nobody can answer on any more.
+    /// a connection is retired. A reply or failure that names an older epoch
+    /// belongs to a connection nobody can answer on any more.
     pub(super) connection_epoch: u64,
     /// Durability lineage of the current connection.
     lineage: Rgetlineage,
-    /// Ordinary tag ownership, indexed independently of the four low control
-    /// tags. A bit stays set through reply consumption until any direct-read
-    /// destination has also been released.
-    pub(super) normal_tags: BitmapVec,
-    /// Prefix of `normal_tags` whose backing slots are resident.
+    /// Wire-tag ownership. A bit stays set through reply consumption until any
+    /// direct-read destination has also been released.
+    pub(super) tags: BitmapVec,
+    /// Prefix of `tags` whose backing slots are resident.
     ///
     /// The high-water mark only grows. It is published after every shard has
     /// been extended, so a resident numeric tag is always addressable.
-    pub(super) resident_normal_tags: usize,
-    /// Next ordinary bitmap index considered by the cyclic allocator.
+    pub(super) resident_tags: usize,
+    /// Next bitmap index considered by the cyclic allocator.
     pub(super) next_tag: usize,
-    pub(super) used_reply_credit: usize,
     pub(super) next_fid: u32,
     pub(super) recycled_fids: KVec<u32>,
     /// Replay records indexed by fid.
@@ -155,30 +158,31 @@ pub(super) struct SessionState {
     /// free slot.
     pub(super) lock_slots_claimed: usize,
     /// Durability obligations, one entry per remote inode holding an
-    /// acknowledged mutation no fsync has verified. Preallocated to
-    /// `UNSYNCED_CAPACITY` and never grown; the scan length is the number of
-    /// live obligations, since a discharged entry is removed.
+    /// acknowledged mutation no fsync has verified. Capacity grows before a
+    /// mutation is dispatched and retains its high-water allocation.
     pub(super) unsynced: KVVec<UnsyncedEntry>,
-    pub(super) orphan: OrphanUnsynced,
+    /// Spare entries promised to mutations that may already be on the wire.
+    pub(super) unsynced_slots_claimed: usize,
     /// Monotonic mutation counter. Every note takes the next value and stamps
     /// it into its entry, so `entry.generation <= snapshot` says exactly "no
     /// mutation touched this inode after that snapshot", including for an inode
     /// that had no entry at snapshot time.
     ///
     /// The userspace client keeps a counter per obligation. That cannot work
-    /// here: a fixed table forces entries to be removed, and a removed then
-    /// recreated entry restarts its counter, so a stale fsync could clear a
-    /// live obligation carrying the same value.
+    /// here: discharged entries are removed, and recreating one would restart
+    /// its counter, allowing a stale fsync to clear a live obligation carrying
+    /// the same value.
     pub(super) mutation_stamp: u64,
     /// Set if `mutation_stamp` ever exhausts u64. Past that point a stamp no
     /// longer separates two windows, so nothing is ever discharged again.
     pub(super) mutation_stamp_exhausted: bool,
-    /// A barrier this connection is running right now, and the stamp it was
-    /// issued with. Another caller whose snapshot it covers waits for it rather
-    /// than issuing a second filesystem-wide flush.
-    pub(super) barrier_in_flight: Option<(u64, u64)>,
-    /// The newest barrier that completed successfully.
-    pub(super) barrier_done: Option<CompletedBarrier>,
+}
+
+/// Durability obligations covered by one verified fsync.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum FsyncScope {
+    Inode(u64),
+    All,
 }
 
 /// Two distinct failure levels.
@@ -193,25 +197,6 @@ pub(super) enum SessionStatus {
     Lost,
     /// Permanent. The first cause wins and is replayed to every later caller.
     Dead(ffi::c_int),
-}
-
-/// A durability barrier that completed on one connection.
-///
-/// The server's flush is unconditional and covers the whole filesystem, so a
-/// barrier issued after a mutation was acknowledged proves that mutation
-/// durable. The token it carried is only a lineage equality check, which a
-/// later caller can evaluate itself against the same connection's lineage.
-/// That is what lets a second fsync adopt this one instead of flushing again.
-#[derive(Clone, Copy)]
-pub(super) struct CompletedBarrier {
-    /// Connection the flush ran on. A barrier on a retired connection proves
-    /// nothing about its replacement.
-    pub(super) epoch: u64,
-    /// `mutation_stamp` when the barrier was issued. Any snapshot at or below
-    /// this was taken before the flush started, so the flush covers it.
-    pub(super) stamp: u64,
-    /// Lineage the connection reported, for the local token verdict.
-    pub(super) lineage: u64,
 }
 
 /// The connection one dispatch attempt is bound to.
@@ -235,12 +220,23 @@ pub(super) struct ReceiveLink {
 /// dialing.
 pub(super) type OrphanedTransports = (Arc<SocketTransport>, Option<Arc<SocketTransport>>);
 
+/// One slot in the mount's filesystem-RPC dispatch window.
+pub(super) struct RequestPermit<'a> {
+    session: &'a Session,
+}
+
+impl Drop for RequestPermit<'_> {
+    fn drop(&mut self) {
+        let mut in_flight = self.session.request_in_flight.lock();
+        debug_assert!(*in_flight > 0);
+        *in_flight = in_flight.saturating_sub(1);
+        drop(in_flight);
+        self.session.request_admission_changed.notify_one();
+    }
+}
+
 impl Session {
-    pub(super) fn new(
-        endpoint: Endpoint,
-        candidate: ProbedCandidate,
-        reply_credit_limit: usize,
-    ) -> Result<Pin<KBox<Self>>> {
+    pub(super) fn new(endpoint: Endpoint, candidate: ProbedCandidate) -> Result<Pin<KBox<Self>>> {
         let timeout_ms = endpoint.timeout_ms;
         let ProbedCandidate {
             transport,
@@ -248,27 +244,16 @@ impl Session {
             lineage,
             target,
         } = candidate;
-        let slot_count = INITIAL_PENDING_TAGS
-            .checked_add(FIRST_NORMAL_TAG)
-            .ok_or_else(|| EOVERFLOW)?;
+        let slot_count = INITIAL_PENDING_TAGS;
         let slot_shards = vacant_slot_shards(slot_count)?;
         let reply_waiters = reply_waiter_queues(slot_count)?;
-        let normal_tags = BitmapVec::new(NORMAL_TAG_COUNT, GFP_KERNEL)?;
-
-        // Preallocated here because a mutation is noted from writeback
-        // context, where growing this table could re-enter the filesystem.
-        let unsynced = KVVec::with_capacity(UNSYNCED_CAPACITY, GFP_KERNEL)?;
+        let tags = BitmapVec::new(TAG_COUNT, GFP_KERNEL)?;
 
         let timeout_jiffies = msecs_to_jiffies(timeout_ms) as usize;
         // Endpoint::validate already rejected a zero timeout, but a small
         // nonzero one still rounds to zero jiffies on a low-HZ kernel, and a
         // zero-jiffy wait expires without ever waiting.
         if timeout_jiffies == 0 {
-            return Err(EINVAL);
-        }
-        // reserve_slot refuses a request whose maximum reply exceeds the credit
-        // pool, so a limit under msize would make a full-size reply unsendable.
-        if reply_credit_limit < msize as usize {
             return Err(EINVAL);
         }
         let receive_capacity = (msize as usize).min(RECEIVE_BATCH_BYTES);
@@ -281,19 +266,17 @@ impl Session {
                 msize,
                 timeout_jiffies,
                 grace_ms: endpoint.grace_ms as u64,
-                // A liveness proof older than the wait it justifies extending
-                // would let a dead peer keep earning windows.
-                liveness_window_ms: LIVENESS_WINDOW_MS.min((timeout_ms as u64 / 2).max(1)),
-                reply_credit_limit,
                 client_id: generate_client_id(),
                 preferred_target: AtomicU32::new(target as u32),
                 msize_mismatch_warned: AtomicBool::new(false),
-                last_frame_ns: AtomicU64::new(monotonic_ns()),
+                receive_generation: AtomicU64::new(0),
                 probe_in_flight: AtomicBool::new(false),
+                liveness_probe_tag: AtomicU32::new(NO_PROBE_TAG),
                 active_epoch: AtomicU64::new(0),
-                sent_count: AtomicUsize::new(0),
                 bulk_reads: AtomicU32::new(0),
                 send_lock <- new_mutex!(()),
+                request_in_flight <- new_mutex!(0usize),
+                request_admission_changed <- new_condvar!(),
                 receive <- new_mutex!(ReceiveState {
                     buffer: receive_buffer,
                     buffered: 0,
@@ -306,10 +289,9 @@ impl Session {
                     candidate: None,
                     connection_epoch: 0,
                     lineage,
-                    normal_tags,
-                    resident_normal_tags: INITIAL_PENDING_TAGS,
+                    tags,
+                    resident_tags: INITIAL_PENDING_TAGS,
                     next_tag: 0,
-                    used_reply_credit: 0,
                     next_fid: ROOT_FID + 1,
                     recycled_fids: KVec::new(),
                     // Client::connect reserves the root slot and records it.
@@ -317,16 +299,10 @@ impl Session {
                     credentials: KVVec::new(),
                     locks: KVVec::new(),
                     lock_slots_claimed: 0,
-                    unsynced,
-                    orphan: OrphanUnsynced {
-                        oldest: None,
-                        generation: 0,
-                        reported: false,
-                    },
+                    unsynced: KVVec::new(),
+                    unsynced_slots_claimed: 0,
                     mutation_stamp: 0,
                     mutation_stamp_exhausted: false,
-                    barrier_in_flight: None,
-                    barrier_done: None,
                 }),
                 changed <- new_condvar!(),
                 live_changed <- new_condvar!(),
@@ -338,6 +314,21 @@ impl Session {
 
     pub(super) fn client_id(&self) -> &[u8] {
         &self.client_id
+    }
+
+    /// Enter the local filesystem-RPC dispatch window.
+    pub(super) fn acquire_request(&self) -> Result<RequestPermit<'_>> {
+        let mut in_flight = self.request_in_flight.lock();
+        while *in_flight >= super::MAX_INFLIGHT_REQUESTS {
+            if self
+                .request_admission_changed
+                .wait_interruptible(&mut in_flight)
+            {
+                return Err(ERESTARTSYS);
+            }
+        }
+        *in_flight += 1;
+        Ok(RequestPermit { session: self })
     }
 
     /// Wait for a live connection and snapshot it under one acquisition.
@@ -353,7 +344,11 @@ impl Session {
     /// wait is interruptible because a caller may hold `i_rwsem`, and bounded
     /// because a netfslib worker running on a shared workqueue must not park
     /// there indefinitely.
-    pub(super) fn dispatch_or_wait(&self, budget_jiffies: usize) -> Result<Dispatch> {
+    pub(super) fn dispatch_or_wait(
+        &self,
+        budget_jiffies: usize,
+        must_complete: bool,
+    ) -> Result<Dispatch> {
         let mut remaining = budget_jiffies.min(self.grace_jiffies());
         loop {
             let mut state = self.state.lock();
@@ -374,7 +369,21 @@ impl Session {
                 .wait_interruptible_timeout(&mut state, remaining)
             {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
-                CondVarTimeoutResult::Signal { .. } => return Err(EINTR),
+                CondVarTimeoutResult::Signal { jiffies } => {
+                    remaining = jiffies;
+                    if !must_complete {
+                        // Nothing requires this logical operation to remain
+                        // owned by the current syscall task.
+                        return Err(ERESTARTSYS);
+                    }
+                    // A prior mutation may already have applied, or a signal
+                    // may have arrived after dispatch. Keep resolving the same
+                    // operation instead of escaping through ERESTARTSYS.
+                    drop(state);
+                    if !sleep_uninterruptible_tick(&mut remaining) {
+                        return Err(ETIMEDOUT);
+                    }
+                }
                 CondVarTimeoutResult::Timeout => return Err(ETIMEDOUT),
             }
         }
@@ -388,10 +397,14 @@ impl Session {
         jiffies_for_ms(self.grace_ms).max(1)
     }
 
-    /// Whether a frame was decoded recently enough to prove a peer is alive.
-    pub(super) fn heard_recently(&self) -> bool {
-        elapsed_ms(self.last_frame_ns.load(Ordering::Relaxed), monotonic_ns())
-            < self.liveness_window_ms
+    /// Snapshot global receive progress for one installed connection.
+    pub(super) fn receive_generation(&self) -> u64 {
+        self.receive_generation.load(Ordering::Acquire)
+    }
+
+    /// Record one complete, tag-validated reply from the installed stream.
+    pub(super) fn note_received_frame(&self) {
+        self.receive_generation.fetch_add(1, Ordering::Release);
     }
 
     /// Retire the connection identified by `epoch`, leaving the session alive.
@@ -486,7 +499,6 @@ impl Session {
         state.connection_epoch = state.connection_epoch.wrapping_add(1);
         self.active_epoch
             .store(state.connection_epoch, Ordering::Release);
-        self.sent_count.store(0, Ordering::Relaxed);
         for shard in self.slot_shards.iter() {
             let mut slots = shard.as_ref().get_ref().lock();
             for slot in slots.iter_mut() {
@@ -495,17 +507,38 @@ impl Session {
                 }
             }
         }
+        let liveness_probe = self.liveness_probe_tag.load(Ordering::Acquire);
+        if liveness_probe != NO_PROBE_TAG {
+            let tag = liveness_probe as usize;
+            if let Ok((shard, local_tag)) = self.slot_shard(tag) {
+                let mut slots = shard.lock();
+                if let Some(slot) = slots.get_mut(local_tag) {
+                    // A reply that reached Completed won the epoch boundary.
+                    // The receiver is about to validate and release it; only
+                    // an unresolved probe belongs to the retirement sweep.
+                    if !matches!(slot.state, PendingState::Completed(_))
+                        && self
+                            .liveness_probe_tag
+                            .compare_exchange(
+                                liveness_probe,
+                                NO_PROBE_TAG,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                    {
+                        drop(vacate_slot(slot));
+                        if tag < TAG_COUNT {
+                            state.tags.clear_bit(tag);
+                        }
+                        self.probe_in_flight.store(false, Ordering::Release);
+                    }
+                }
+            }
+        } else {
+            self.probe_in_flight.store(false, Ordering::Release);
+        }
         true
-    }
-
-    pub(super) fn decrement_sent_count(&self) {
-        // Retirement may reset this advisory count while a reply that already
-        // won its tag lock finishes.
-        let _ = self
-            .sent_count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                Some(count.saturating_sub(1))
-            });
     }
 
     /// Wake every wait that observes `SessionStatus`.
@@ -528,21 +561,15 @@ impl Session {
         lineage: Rgetlineage,
     ) -> Result<()> {
         // Replay still needs bounded receives. Once this transport is visible
-        // to the session, request waiters own response timeouts and retire it
-        // by shutdown, so the sole receiver may block here while idle.
+        // to the session, request waiters test connection-global receive
+        // progress before retiring it, so the sole receiver may block here
+        // while idle.
         transport.set_blocking_receive()?;
         let _send = self.send_lock.lock();
         let mut receive = self.receive.lock();
         let mut state = self.state.lock();
         if let SessionStatus::Dead(status) = state.status {
             return Err(Error::from_errno(status));
-        }
-        // A completed Rflush is a stream-consumption barrier owned by an
-        // interrupted caller. Vacating it here would make that caller's
-        // completion path see a slot it never consumed, so let the owner
-        // finish and dial again.
-        if self.flush_reply_pending() {
-            return Err(EAGAIN);
         }
         // The retired stream's bytes went with its socket.
         receive.buffered = 0;
@@ -551,7 +578,6 @@ impl Session {
         state.lineage = lineage;
         state.status = SessionStatus::Connected;
         state.next_tag = 0;
-        self.last_frame_ns.store(monotonic_ns(), Ordering::Relaxed);
         drop(state);
         drop(receive);
 
@@ -600,9 +626,7 @@ fn vacant_slot_shards(count: usize) -> Result<KVVec<Pin<KBox<Mutex<KVVec<Pending
                 .map_err(|_| ENOMEM)?;
         }
         let shard = KBox::pin_init(new_mutex!(slots), GFP_KERNEL)?;
-        shards
-            .push_within_capacity(shard)
-            .map_err(|_| ENOMEM)?;
+        shards.push_within_capacity(shard).map_err(|_| ENOMEM)?;
     }
     Ok(shards)
 }
@@ -612,8 +636,7 @@ fn small_reply_pool() -> Result<KVVec<KVVec<u8>>> {
     let mut pool = KVVec::with_capacity(SMALL_REPLY_BUFFERS, GFP_KERNEL)?;
     for _ in 0..SMALL_REPLY_BUFFERS {
         let buffer = KVVec::with_capacity(SMALL_REPLY_BYTES, GFP_KERNEL)?;
-        pool.push_within_capacity(buffer)
-            .map_err(|_| ENOMEM)?;
+        pool.push_within_capacity(buffer).map_err(|_| ENOMEM)?;
     }
     Ok(pool)
 }
@@ -626,9 +649,7 @@ fn reply_waiter_queues(slot_count: usize) -> Result<KVVec<Pin<KBox<CondVar>>>> {
     let mut waiters = KVVec::with_capacity(count, GFP_KERNEL)?;
     for _ in 0..count {
         let waiter = KBox::pin_init(new_condvar!(), GFP_KERNEL)?;
-        waiters
-            .push_within_capacity(waiter)
-            .map_err(|_| ENOMEM)?;
+        waiters.push_within_capacity(waiter).map_err(|_| ENOMEM)?;
     }
     Ok(waiters)
 }

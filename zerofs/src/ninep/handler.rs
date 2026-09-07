@@ -2171,7 +2171,7 @@ impl NinePHandler {
         let fid = self.get_fid(tf.fid)?;
         let fid_path = fid.path.clone();
 
-        self.filesystem.client_fsync().await?;
+        self.filesystem.client_fsync_inode(fid.inode_id).await?;
 
         {
             let path = if fid_path.is_empty() {
@@ -2194,13 +2194,23 @@ impl NinePHandler {
         Ok(Message::Rfsync(Rfsync))
     }
 
-    /// Flush and verify the client's oldest unflushed-write lineage token.
-    /// Token zero means no unflushed write; a broken lineage returns `ESTALE`.
+    /// Flush and verify the client's oldest unverified lineage token.
+    /// New clients explicitly request inode scope; an unscoped request remains
+    /// global for compatibility with earlier versions of the private dialect.
     async fn fsyncdur(&self, tf: Tfsyncdur) -> P9Result<Message> {
         let fid = self.get_fid(tf.fid)?;
         let fid_path = fid.path.clone();
 
-        self.filesystem.client_fsync_verified(tf.token).await?;
+        if tf.datasync & !P9_FSYNC_KNOWN_FLAGS != 0 {
+            return Err(P9Error::InvalidArgument);
+        }
+        if tf.datasync & P9_FSYNC_INODE != 0 {
+            self.filesystem
+                .client_fsync_inode_verified(fid.inode_id, tf.token)
+                .await?;
+        } else {
+            self.filesystem.client_fsync_verified(tf.token).await?;
+        }
 
         {
             let path = if fid_path.is_empty() {
@@ -4135,6 +4145,159 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(data.as_ref(), b"later");
+    }
+
+    #[tokio::test]
+    async fn fsync_uses_shared_inode_generation_and_ignores_unrelated_dirtiness() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        fs.create(&creds, 0, b"generation-target", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.client_fsync().await.unwrap();
+
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        start_plain_session(&handler).await;
+        expect_walk(&handler, 2, 1, 2, &[b"generation-target"]).await;
+        expect_walk(&handler, 3, 1, 3, &[b"generation-target"]).await;
+        open_fid(&handler, 4, 2, O_RDWR as u32).await;
+        open_fid(&handler, 5, 3, O_RDWR as u32).await;
+
+        let baseline = fs.flush_coordinator.requested_flush_count();
+        let write = request(
+            &handler,
+            6,
+            Message::Twrite(Twrite {
+                fid: 2,
+                offset: 0,
+                count: 5,
+                data: DekuBytes::from(b"hello".to_vec()),
+            }),
+        )
+        .await;
+        assert!(matches!(write.body, Message::Rwrite(Rwrite { count: 5 })));
+
+        let first = request(
+            &handler,
+            7,
+            Message::Tfsync(Tfsync {
+                fid: 3,
+                datasync: 0,
+            }),
+        )
+        .await;
+        assert!(matches!(first.body, Message::Rfsync(_)));
+        assert_eq!(fs.flush_coordinator.requested_flush_count(), baseline + 1);
+
+        fs.create(
+            &creds,
+            0,
+            b"unrelated-dirty-file",
+            &SetAttributes::default(),
+        )
+        .await
+        .unwrap();
+
+        let repeated = request(
+            &handler,
+            8,
+            Message::Tfsync(Tfsync {
+                fid: 2,
+                datasync: 0,
+            }),
+        )
+        .await;
+        assert!(matches!(repeated.body, Message::Rfsync(_)));
+        assert_eq!(fs.flush_coordinator.requested_flush_count(), baseline + 1);
+
+        let directory = request(
+            &handler,
+            9,
+            Message::Tfsync(Tfsync {
+                fid: 1,
+                datasync: 0,
+            }),
+        )
+        .await;
+        assert!(matches!(directory.body, Message::Rfsync(_)));
+        assert_eq!(fs.flush_coordinator.requested_flush_count(), baseline + 2);
+    }
+
+    #[tokio::test]
+    async fn fsyncdur_honors_inode_and_global_scope_and_ignores_datasync() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        fs.create(
+            &creds,
+            0,
+            b"verified-generation-target",
+            &SetAttributes::default(),
+        )
+        .await
+        .unwrap();
+        fs.client_fsync().await.unwrap();
+
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+        expect_walk(&handler, 2, 1, 2, &[b"verified-generation-target"]).await;
+
+        let baseline = fs.flush_coordinator.requested_flush_count();
+        fs.create(
+            &creds,
+            0,
+            b"verified-unrelated-dirty-file",
+            &SetAttributes::default(),
+        )
+        .await
+        .unwrap();
+
+        let inode = request(
+            &handler,
+            3,
+            Message::Tfsyncdur(Tfsyncdur {
+                fid: 2,
+                datasync: P9_FSYNC_DATASYNC | P9_FSYNC_INODE,
+                token: fs.lineage_token,
+            }),
+        )
+        .await;
+        assert!(matches!(inode.body, Message::Rfsync(_)));
+        assert_eq!(fs.flush_coordinator.requested_flush_count(), baseline);
+
+        let global = request(
+            &handler,
+            4,
+            Message::Tfsyncdur(Tfsyncdur {
+                fid: 2,
+                datasync: P9_FSYNC_DATASYNC,
+                token: fs.lineage_token,
+            }),
+        )
+        .await;
+        assert!(matches!(global.body, Message::Rfsync(_)));
+        assert_eq!(fs.flush_coordinator.requested_flush_count(), baseline + 1);
+    }
+
+    #[tokio::test]
+    async fn fsyncdur_rejects_unknown_flags() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+
+        let response = request(
+            &handler,
+            2,
+            Message::Tfsyncdur(Tfsyncdur {
+                fid: 1,
+                datasync: 1 << 31,
+                token: fs.lineage_token,
+            }),
+        )
+        .await;
+        assert!(matches!(
+            response.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EINVAL as u32
+        ));
     }
 
     #[tokio::test]

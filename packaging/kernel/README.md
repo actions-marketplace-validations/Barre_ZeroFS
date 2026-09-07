@@ -1,259 +1,189 @@
-# ZeroFS kernel module packages
+# ZeroFS kernel-client packages
 
-Each repository channel has a `zerofs-kernel-client` selector for one tested
-kernel. Selectors depend on co-installable module packages whose names contain
-the target ID and exact kernel release. Module packages install:
+`zerofs-kernel-client` installs a DKMS-managed client under
+`/usr/src/zerofs-<package-version>`, registers it with DKMS, and sets
+`AUTOINSTALL=yes`. Package installation asks DKMS to provide the module for the
+running and newest installed kernels when their headers are present; distro
+kernel-install hooks repeat that operation when a kernel is added later.
 
-```text
-/lib/modules/<kernel-release>/updates/zerofs/zerofs.ko
-```
+The DKMS build first requests an exact, signed module that ZeroFS CI has built
+and boot-tested for the installed kernel package. The client derives its URL
+from the local package database, verifies the dedicated ZeroFS X.509 signature,
+the signed distro/header-package identity, architecture, and vermagic, then
+hands it back to DKMS for normal installation and any configured machine-local
+signing. The lookup does not use the current operating-system release version,
+so a retained kernel continues to resolve after an OS upgrade. A missing or
+temporarily unreachable object falls through to source compilation; a
+downloaded object that fails verification is a hard error.
 
-The selector installs `/usr/lib/modules-load.d/zerofs.conf` and attempts
-`modprobe zerofs` only when it targets the running kernel. Module packages run
-`depmod`.
+The DEB and RPM variants depend only on DKMS and the tools needed to fetch and
+verify a published module. Matching kernel headers are package-managed
+prerequisites; kernels without packaged Rust metadata also require their exact
+distribution source package for the source fallback. That fallback uses only
+installed files and never invokes a package manager. It is an escape hatch for
+prepared development systems; published modules are the normal support path.
 
-Selectors conflict with rolling kernel packages newer than their tested
-target. Publishing a selector for a newer target raises that limit.
+The package does not install, select, or hold a distribution kernel. DKMS
+excludes module builds below the Linux 6.18 floor and applies no version
+exclusion above it. Every otherwise eligible kernel presented to DKMS is
+attempted. If neither a published object nor the optional source prerequisites
+are available, the eligible DKMS build fails rather than completing without
+`zerofs.ko`. Authentication, compilation, and installation errors are hard
+failures too. Debian-family kernel hooks normally propagate these failures and
+leave kernel package configuration incomplete; Fedora- and openSUSE-family
+hooks may let the transaction complete. Keep the preceding kernel installed as
+a boot fallback and check `dkms status` before booting the new kernel. Removal
+unregisters the matching DKMS source version and leaves other ZeroFS versions
+alone.
 
-## Distribution channels
+With no installed headers, package configuration registers the source, warns,
+and succeeds. Once an eligible kernel with headers is presented, publish its
+module or install the source prerequisites before retrying `dkms autoinstall`.
 
-`targets.json` tracks Ubuntu 26.04, Ubuntu 24.04 HWE, Debian 13 backports,
-Fedora 43 and 44, and openSUSE Tumbleweed. Ubuntu, Debian, and Fedora cover
-x86-64 and arm64; openSUSE currently covers x86-64.
+## Source fallback modes
 
-## Build
+The packaged wrapper examines the target build tree and chooses one of three
+paths:
 
-The builder requires `nfpm`, `modinfo`, Python, `readelf`, and `sha256sum`.
-Signed packages additionally require OpenSSL. The module must be signed before
-packaging when the target enforces module signatures.
+1. `CONFIG_RUST=y` with `rust/libkernel.rmeta` uses the normal external Rust
+   module build.
+2. `CONFIG_RUST=y` without packaged metadata regenerates the metadata from the
+   matching distribution kernel source, then uses the normal build.
+3. `CONFIG_RUST=n` on a compatible x86-64 kernel uses the self-contained
+   builder. It compiles the kernel Rust support and ZeroFS together,
+   internalizes the Rust support, and leaves the module importing normal C
+   kernel symbols.
 
-```sh
-packaging/kernel/build.sh \
-  --module target/zerofs.ko \
-  --kernel-release 7.0.0-28-generic \
-  --target-id ubuntu-26.04-generic-7.0.0-28 \
-  --channel-id ubuntu-26.04-generic-x86-64 \
-  --arch x86_64 \
-  --version 2.1.2 \
-  --revision 1 \
-  --source-commit 0123456789012345678901234567890123456789 \
-  --source-tree-state clean \
-  --tooling-commit 0123456789012345678901234567890123456789 \
-  --tooling-tree-state clean \
-  --kernel-package-dependency 'linux-image-7.0.0-28-generic (= 7.0.0-28.28)' \
-  --kernel-upgrade-conflict 'linux-image-generic (>> 7.0.0-28.28)' \
-  --license 'REVIEWED-LICENSE-EXPRESSION' \
-  --family deb \
-  --output-dir dist/kernel
-```
+The third path is intentionally narrower. It requires the configured header
+tree (`.config`, generated headers, and `Module.symvers`), the matching
+distribution kernel source, Rust sources and compiler, and matching C and LLVM
+tools. It does not make kernels older than Linux 6.18 or otherwise incompatible
+kernel configurations work, and currently supports x86-64 only.
 
-Use `--family rpm` for RPM packages. Architectures may be written as
-`amd64`/`x86_64` or `arm64`/`aarch64`.
+No fallback mode fetches toolchains or source while DKMS is running. Exact
+toolchain and source availability is an operating-system package prerequisite,
+not an install-script fallback.
 
-`SOURCE_DATE_EPOCH`, when set, is recorded in each package's provenance
-manifest. The module package also records the exact target, vermagic, module
-size, and SHA-256 digest. The builder rejects a module whose name is not
-`zerofs` or whose vermagic does not start with the requested kernel release.
+## Compatibility lock
 
-`--kernel-package-dependency` is copied into the native package dependency
-metadata and must pin the exact distro kernel package. Its syntax is
-family-specific. For example:
-
-```text
-deb: linux-image-7.0.0-28-generic (= 7.0.0-28.28)
-rpm: kernel-core-uname-r = 7.0.0-28.el10.x86_64
-```
-
-Each module package provides a versioned `zerofs-kernel-module` capability.
-
-`--license` is mandatory. The release pipeline must pass the license expression
-approved for the combined kernel payload; the builder does not infer one from
-the repository or `MODULE_LICENSE`.
-
-## Target catalog
-
-`targets.json` is the canonical kernel target catalog:
+`kernels.lock.json` records the exact distro kernels that CI has certified and
+for which it publishes signed modules. It is not embedded in
+`zerofs-kernel-client`:
 
 ```sh
 python3 packaging/kernel/kernel-targets.py \
-  --manifest packaging/kernel/targets.json matrix --scope ci
+  --manifest packaging/kernel/kernels.lock.json matrix
 python3 packaging/kernel/kernel-targets.py \
-  --manifest packaging/kernel/targets.json matrix --scope publish
-python3 packaging/kernel/kernel-targets.py \
-  --manifest packaging/kernel/targets.json matrix --scope discover
-python3 packaging/kernel/kernel-targets.py \
-  --manifest packaging/kernel/targets.json \
-  field ubuntu-26.04-generic-7.0.0-28 kernel_release
+  --manifest packaging/kernel/kernels.lock.json discovery-matrix
 ```
 
-Unsupported kernels are kept in `unsupported_targets`; validation prevents
-them from entering CI. Every target names a stable repository channel and has
-a positive package revision. Revisions for targets in the same channel must
-increase in manifest order. A target cannot be published unless it is enabled
-and CI-tested, and each channel can have only one current publication target.
-The `publish` scope selects only targets with `publish: true`, so an
-unpublished CI candidate cannot block a server release.
+The compact file groups discovery and reproducible build inputs by distro
+stream and architecture. Target IDs, package family, and workflow fields are
+derived by the loader. The retained locks give CI a current target and a
+rollback target and are ordered oldest to newest. A lock update publishes
+modules for the latest stable ZeroFS package without changing that package.
+The workflow downloads and audits the GPG-signed DEB and RPM already present
+in the public repositories; it does not reconstruct a hypothetical package
+revision from newer tooling.
 
-`ci: true` enables package and boot testing. `publish: true` adds a tested
-target to its repository channel.
+ZeroFS requires Linux 6.18 or newer because older kernels predate the required
+netfs API. The lock's stream and architecture keys are the source of truth for
+CI coverage; the [kernel-client guide](../../documentation/src/app/kernel-client/page.mdx#compatibility)
+shows the user-facing matrix.
 
-The hourly `kernel-target-updates` workflow checks each configured channel and
-maintains one `kernel-update` issue per channel when a newer kernel is
-available. It does not modify branches or pull requests. Each issue contains
-the `discover` and `apply` commands for a manifest update. Manifest PRs run the
-target build and QEMU smoke tests.
+## Kernel update flow
 
-`build-target.sh` builds one manifest target in its configured container.
-Builder images are digest-pinned except for openSUSE Tumbleweed, whose official
-Docker Hub image exposes only the rolling `latest` tag. It selects the
-external-module, generated-metadata, or self-contained build from the target
-inputs. With `--module`, the host must already contain the matching
-`/lib/modules/<release>` tree and `/boot/vmlinuz-<release>`.
-The host also needs a statically linked, target-architecture `busybox`.
-`build-target.sh` verifies its architecture and required applets before adding
-it to the QEMU boot-test artifact.
+Every 15 minutes, the `kernel-target-updates` workflow discovers all channels and
+maintains one aggregate update PR. Successful discoveries survive unrelated
+channel failures, while conflicting edits to the same channel fail closed.
+Force-with-lease and default-branch comparisons prevent stale automation from
+overwriting newer lock changes.
 
-For Fedora kernels that need generated Rust metadata, the container reads the
-exact Fedora Rust build from the kernel's `auto.conf`. If the Fedora
-repository has advanced, it installs that exact archived Rust build before
-compiling metadata. Every Koji RPM is SHA-256-pinned. Targets using Koji's
-signed archive also verify the configured Fedora key fingerprint. Other build
-dependencies come from the configured Fedora repositories.
-Ubuntu and Debian builds likewise install `rustfmt` from the same distribution
-Rust build selected for `rustc`; versioned packages are preferred when
-available. They also select the matching versioned Rust source package, which
-matters for Ubuntu 24.04 HWE because the kernel toolchain is newer than the
-distribution's default Rust toolchain. Ubuntu's arm64 kernel packages do not
-currently ship the separate `linux-lib-rust` metadata package, so those jobs
-reconstruct `libkernel.rmeta` from the exact snapshot source and configured
-header tree. The container also prefers the compiler named by
-`CONFIG_CC_VERSION_TEXT`, passes it to metadata and module builds, and records
-both the configured and selected compiler in `build-info`. A same-family
-fallback remains visible as `target_cc_exact=false`; the self-contained path
-rejects such a fallback because it requires the exact target compiler.
-The official openSUSE builder image supplies its trusted distribution keys;
-snapshot refreshes never import a key advertised by repository metadata.
+Ordinary PR workflows are skipped when the lock is the only changed file. The
+trusted updater instead dispatches `ci` for the exact update-branch commit and
+keeps one PR comment linked to that CI run. Each reconciled head updates the
+same comment; merge when the linked run's `ci / required` job passes.
 
-The self-contained path handles a narrower `CONFIG_RUST=n` case; it is not a
-general compatibility layer. It needs the exact full kernel source, configured
-build tree, `Module.symvers`, Rust sources/toolchain, and matching LLVM tools.
-Those inputs are suitable for a controlled release job, not a headers-only
-local build. It currently supports x86-64 only and does not make kernels with
-an older netfs API compatible. Repository CI boots the Linux 6.18 floor with
-`CONFIG_RUST=n`, then mounts and exercises ZeroFS through the resulting module.
+The PR builds the actual kernel-client package in a clean target environment,
+installs the exact kernel, headers, source, and toolchain, and forces the DKMS
+source fallback to build `zerofs.ko`. CI checks the resulting module and boots
+that kernel in QEMU, where it loads ZeroFS and runs mount and I/O smoke tests. A
+new kernel is not certified merely because compilation succeeds.
+
+If the kernel is incompatible, the lock PR stays red. The ZeroFS fix lands
+through a normal source PR on the default branch; the next discovery run
+reconciles the lock branch on top of it and reruns compatibility CI. Merging
+the lock records compatibility and triggers publication of the boot-tested
+module for the latest stable ZeroFS release. Source fixes still reach users in
+the next normal ZeroFS release. A no-op run closes an obsolete update PR. Lock
+reconciliation uses force-with-lease, while repository writers use their
+shared `queue: max` concurrency group; these are separate race controls for
+separate resources.
+
+## Reproducible target builds
+
+`build-target.sh` resolves one lock in its digest-pinned builder image. Its
+kernel, source-package, toolchain, and boot-test inputs are verified before
+use:
 
 ```sh
-ZEROFS_KERNEL_PACKAGE_LICENSE='REVIEWED-LICENSE-EXPRESSION' \
-  packaging/kernel/build-target.sh \
-    --manifest packaging/kernel/targets.json \
-    --target-id ubuntu-26.04-generic-7.0.0-28 \
-    --output-dir target/kernel-package
+target_id=$(packaging/kernel/kernel-targets.py \
+  --manifest packaging/kernel/kernels.lock.json matrix |
+  jq -r '.include[0].id')
+packaging/kernel/build-target.sh \
+  --manifest packaging/kernel/kernels.lock.json \
+  --target-id "$target_id" \
+  --source-package staged \
+  --output-dir target/kernel-artifact
 ```
 
-The output contains `artifact.json`, the prepared module, the module and
-selector packages, the exact distro kernel image, the static boot-test
-BusyBox, and loadable dependencies as raw `.ko` files in load order. The
-upstream package version is read from `zerofs/Cargo.toml`; the release workflow
-also requires tag `vX.Y.Z` to match it. Package revisions come from
-`targets.json`. All module packages use the same `X.Y.Z` as the ZeroFS server
-release. They do not depend on a locally installed server.
+Use the RPM package for an RPM-family target. The source package can be built
+with `packaging/kernel/kernel-source-package.py --output staged`; that helper
+requires nFPM. It derives the package version from `zerofs/Cargo.toml` and uses
+`SOURCE_DATE_EPOCH` when provided or the checked-out commit time otherwise. It
+applies that timestamp to every nFPM input so rebuilding the same source
+produces the same unsigned package.
 
-The artifact and both package provenance records identify the source and
-packaging-tooling commits and whether each tree was clean. Set
-`ZEROFS_REQUIRE_CLEAN_SOURCE=1` for release builds.
-
-The boot modules and BusyBox are smoke-test payloads. They are neither
-installed by the DEB/RPM packages nor published to the package repository.
-The artifact records the BusyBox package identity, version banner, and exact
-file digest so the CI input is attributable.
-
-For signing, write the dedicated module-signing key and certificate into
-private temporary files, select an independently trusted
-kmodsign-compatible executable with `ZEROFS_MODULE_SIGNER`, and set
-`ZEROFS_MODULE_SIGN_KEY` and `ZEROFS_MODULE_SIGN_CERT` to the key and PEM or
-DER certificate paths. `ZEROFS_MODULE_SIGN_HASH` defaults to `sha256`. The
-builder converts the public certificate to DER, stores its fingerprint in
-provenance, and includes it with selectors. The builder never executes a signer
-produced by a target build. Do not use the package-repository OpenPGP key for
-module signing.
-
-The release workflow keeps two identities separate:
-
-- `GPG_PRIVATE_KEY` and `GPG_KEY_ID` sign DEB/RPM repository material;
-- `KERNEL_MODULE_SIGNING_KEY` and `KERNEL_MODULE_SIGNING_CERT` sign
-  `zerofs.ko`.
-
-The module key is a passphrase-less PEM private key. Its matching PEM X.509
-certificate must include the Code Signing extended key usage and remain valid
-for at least 30 days when a release starts. Both private keys are supplied
-through GitHub Secrets and should be backed up and access-controlled
-independently.
-
-Prebuilt selectors install the certificate at
-`/usr/share/zerofs/zerofs-module-signing-cert.der`. If Secure Boot rejects the
-module, its postinstall script leaves the package configured and prints:
+With Docker available, run the package-manager checks locally with:
 
 ```sh
-sudo mokutil --import \
-  /usr/share/zerofs/zerofs-module-signing-cert.der
+kernel/ci/dkms-package-install-smoke.sh \
+  staged/deb/zerofs-kernel-client_*_all.deb \
+  staged/rpm/zerofs-kernel-client-*.noarch.rpm
 ```
 
-Enrollment requires the distribution's MOK confirmation and a reboot; the
-package never enrolls a key automatically. A module signature alone is not a
-Secure Boot trust grant.
+The script uses builder images resolved from the lock: Ubuntu and Fedora run
+the complete install/remove lifecycle, while Tumbleweed checks RPM dependency
+resolution. `build-target.sh` performs the full package install and DKMS build
+for an exact locked kernel.
 
-## Repository layout
+Tumbleweed uses the Docker Hub base image because
+`registry.opensuse.org` has pruned old digest-addressed rolling images in
+practice. Package inputs still come from the locked openSUSE historical
+snapshot. Fedora jobs obtain any exact archived Rust build named by the target
+kernel, reconstruct signed RPMs from Koji's retained signature headers, and
+verify each package digest and signing-key fingerprint. Ubuntu and Debian jobs
+likewise select the matching versioned Rust sources and compiler tools. These
+networked resolution steps happen only in controlled CI; they are not part of
+the installed DKMS hook.
 
-Prebuilt module packages are safe to collect in a common artifact store because
-their names include the target and exact kernel release.
+Each target artifact includes the module, exact kernel image, loadable boot
+dependencies, and a static target-architecture BusyBox. These are smoke-test
+payloads only and are not installed by or published inside the source package.
+Release builds require the tag version to match `zerofs/Cargo.toml`.
 
-The `zerofs-kernel-client` selector must be published only in the repository
-channel for its target distribution, release, flavor, and architecture. Two
-selectors with identical package versions but different dependencies must not
-be published in one repository channel. Updating that selector is how a
-channel moves users to a newly supported kernel.
+## Signing and Secure Boot
+
+Published modules carry a ZeroFS signature used to authenticate the downloaded
+artifact. DKMS preserves it and may append the machine-local key configured by
+the distribution. A Secure Boot machine may require that local DKMS key to be
+enrolled through the distribution's MOK workflow before `modprobe zerofs`
+succeeds. Package scripts never enroll a key automatically.
 
 ## Publication
 
-`kernel-artifacts.py` verifies target and release identity, file hashes, the
-PKCS#7 module signature, and the shared signing certificate before staging
-packages. `.github/workflows/_publish-repo.yml` signs and publishes each
-repository channel.
-
-## Prepare a module
-
-`prepare-module.sh` copies a module to a new path, validates its name, exact
-kernel release, and ELF architecture, and can strip debug data with an explicit
-target strip executable:
-
-```sh
-packaging/kernel/prepare-module.sh \
-  --input target/kernel/x86_64/7.0.0-28-generic/zerofs.ko \
-  --output dist/zerofs.ko \
-  --kernel-release 7.0.0-28-generic \
-  --arch x86_64 \
-  --strip-tool /usr/bin/x86_64-linux-gnu-strip
-```
-
-For a signed release artifact, pass a trusted signer with kmodsign-compatible
-`HASH KEY CERT MODULE` arguments and the dedicated module-signing key pair.
-`kmodsign` expects the certificate in DER form:
-
-```sh
-packaging/kernel/prepare-module.sh \
-  --input target/zerofs.ko \
-  --output dist/zerofs.ko \
-  --kernel-release 7.0.0-28-generic \
-  --arch x86_64 \
-  --strip-tool /usr/bin/x86_64-linux-gnu-strip \
-  --signer /usr/bin/kmodsign \
-  --sign-key /secure/zerofs-module-signing-key.pem \
-  --sign-cert /secure/zerofs-module-signing-key.der \
-  --sign-hash sha256
-```
-
-Stripping always happens before signing. Signing arguments are all-or-none;
-omitting them adds no signature, which permits unsigned CI artifacts when the
-input is unsigned. The script never changes its input, atomically refuses to
-overwrite its output, and verifies the signature metadata before publishing a
-signed result.
+`zerofs-kernel-client` ships through normal ZeroFS releases. Releases and later
+kernel-lock updates add immutable objects below `kernel-modules/v1`; old
+objects remain available for rollback kernels. Unified repository layout,
+signing, serialization, and the release gate are documented in
+[native package publishing](../README.md#publishing).

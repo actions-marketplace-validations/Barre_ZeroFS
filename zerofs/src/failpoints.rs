@@ -34,7 +34,6 @@ pub const RECLAIM_HOLDING_LOCK_BEFORE_DELETE: &str = "reclaim_holding_lock_befor
 
 /// HA startup orphan drain, immediately before initializing the durable orphan
 /// scan. Return-style: `fail::cfg(STARTUP_ORPHAN_LIST_INIT, "return")`.
-#[allow(dead_code)]
 pub const STARTUP_ORPHAN_LIST_INIT: &str = "startup_orphan_list_init";
 
 pub const RENAME_AFTER_TARGET_DELETE: &str = "rename_after_target_delete";
@@ -69,6 +68,10 @@ pub const RMDIR_AFTER_INODE_DELETE: &str = "rmdir_after_inode_delete";
 pub const RMDIR_AFTER_DIR_CLEANUP: &str = "rmdir_after_dir_cleanup";
 
 pub const FLUSH_AFTER_COMPLETE: &str = "flush_after_complete";
+
+/// A SlateDB manifest PUT is blocked until the current ZeroFS segment PUT
+/// succeeds.
+pub const MANIFEST_PUBLICATION_WAITING: &str = "manifest_publication_waiting";
 
 // Data plane (extent-over-segments).
 
