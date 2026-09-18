@@ -95,7 +95,7 @@ impl ExtentStore {
     /// caller's job (see [`Self::delete_range`], which debits as it scans).
     pub fn delete(&self, txn: &mut Transaction, id: InodeId, extent_idx: u64) {
         let key = self.key_codec.extent_key(id, extent_idx);
-        txn.delete_bytes(&key);
+        txn.delete_bytes(&key.into());
     }
 
     /// Stage live/total byte deltas for `segid`'s counter onto the txn; the
@@ -263,7 +263,7 @@ impl ExtentStore {
                             byte_len: 4 + sealed_len,
                         };
                         txn.put_bytes(
-                            &self.key_codec.extent_key(id, *extent),
+                            &self.key_codec.extent_key(id, *extent).into(),
                             Bytes::copy_from_slice(&loc.encode()),
                         );
                         // Credit the frame just appended: both live and total.
@@ -443,7 +443,7 @@ impl ExtentStore {
 
         // Read the existing content of any partially-overwritten extent (full
         // overwrites and extents past EOF need no read).
-        let existing_extents: HashMap<u64, Bytes> = stream::iter(start_extent..=end_extent)
+        let mut existing_extents: HashMap<u64, Bytes> = stream::iter(start_extent..=end_extent)
             .map(|extent_idx| {
                 let extent_start = extent_idx * EXTENT_SIZE as u64;
                 let extent_end = extent_start + EXTENT_SIZE as u64;
@@ -486,7 +486,10 @@ impl ExtentStore {
             let extent: Bytes = if write_start == 0 && write_end == EXTENT_SIZE {
                 data.slice(data_offset..data_offset + write_len)
             } else {
-                let mut buf = BytesMut::from(existing_extents[&extent_idx].as_ref());
+                // Consume the decoded extent so uniquely owned storage can be reused.
+                // Static zero extents and shared buffers are copied by BytesMut.
+                let existing = existing_extents.remove(&extent_idx).expect("extent loaded");
+                let mut buf = BytesMut::from(existing);
                 buf[write_start..write_end]
                     .copy_from_slice(&data[data_offset..data_offset + write_len]);
                 buf.freeze()
@@ -881,7 +884,7 @@ mod tests {
         write_and_check(&store, &db, &mut model, 0, &vec![0u8; EXTENT_SIZE]).await;
         // The extent key for extent 0 must be gone.
         let key = store.key_codec.extent_key(1, 0);
-        assert!(db.get_bytes(&key).await.unwrap().is_none());
+        assert!(db.get_bytes(key.as_ref()).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1016,7 +1019,7 @@ mod tests {
             let data = incompressible(7, 3 * EXTENT_SIZE);
             write_and_check(&store, &db, &mut model, 0, &data).await;
             let key = store.key_codec.extent_key(1, 1);
-            let encoded = db.get_bytes(&key).await.unwrap().unwrap();
+            let encoded = db.get_bytes(key.as_ref()).await.unwrap().unwrap();
             let loc = FrameLoc::decode(&encoded).unwrap();
             let shipped = store.read_frame_for_ship(loc).unwrap();
             assert_eq!(shipped.len(), loc.byte_len as usize);
@@ -1041,9 +1044,9 @@ mod tests {
                 &data[EXTENT_SIZE..2 * EXTENT_SIZE]
             );
             assert!(store.unflushed_bytes() > 0);
-            let ops = store.enrich_repl_ops(vec![ReplOp::Put(key.clone(), encoded.clone())]);
+            let ops = store.enrich_repl_ops(vec![ReplOp::Put(key.into(), encoded.clone())]);
             assert!(matches!(&ops[..], [ReplOp::PutFrame(k, v, frame)]
-                if k == &key && v == &encoded && frame == &shipped));
+                if k.as_ref() == key.as_ref() && v == &encoded && frame == &shipped));
             assert!(
                 store
                     .frame_chunks_in_ram(
@@ -1070,7 +1073,7 @@ mod tests {
             assert_eq!(directory.len(), 3);
             assert_eq!(directory[1].byte_offset, loc.byte_offset);
             assert!(matches!(
-                &store.enrich_repl_ops(vec![ReplOp::Put(key, encoded)])[..],
+                &store.enrich_repl_ops(vec![ReplOp::Put(key.into(), encoded)])[..],
                 [ReplOp::Put(_, _)]
             ));
         }

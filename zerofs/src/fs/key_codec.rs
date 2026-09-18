@@ -43,25 +43,25 @@ const PREFIX_ORPHAN: u8 = 0x08;
 const PREFIX_SEGCOUNT: u8 = 0x09;
 const PREFIX_EXTENT: u8 = 0xFE;
 
-const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
+const SYSTEM_COUNTER_KEY: &[u8; 6] = b"meta\x06\x01";
 // HA: the highest shipped replication batch seqno (with its writer epoch) that
 // has been flushed into this data db. Written atomically with each shipped
 // batch so a promoted standby can prune its tail to exactly what the db already
 // holds (see write_coordinator + takeover replay).
-const SYSTEM_HA_SEQNO_SUBTYPE: u8 = 0x02;
+const SYSTEM_HA_SEQNO_KEY: &[u8; 6] = b"meta\x06\x02";
 // Durability lineage token (see fsync-honesty / ZeroFS::lineage_token). A single
 // u64 identifying the current unbroken durable lineage. Regenerated at a cold
 // bootstrap or a Solo-tainted takeover; carried forward unchanged at an untainted
 // takeover (so a clean failover keeps a client's fsync transparent).
-const SYSTEM_LINEAGE_SUBTYPE: u8 = 0x03;
+const SYSTEM_LINEAGE_KEY: &[u8; 6] = b"meta\x06\x03";
 // Solo taint: set to the lineage token that was live when the leader first
 // downgraded to Solo replication. A takeover reads it to decide keep-vs-regenerate
 // the lineage token (taint == stored lineage => the lineage may be missing acked
 // Solo writes => regenerate, so those writes' fsync fails instead of reporting success).
-const SYSTEM_TAINT_SUBTYPE: u8 = 0x04;
+const SYSTEM_TAINT_KEY: &[u8; 6] = b"meta\x06\x04";
 // Wall-clock epoch-seconds (u64 LE via encode_u64) of the last completed slow
 // orphan sweep.
-const SYSTEM_ORPHAN_SWEEP_SUBTYPE: u8 = 0x05;
+const SYSTEM_ORPHAN_SWEEP_KEY: &[u8; 6] = b"meta\x06\x05";
 
 const U64_SIZE: usize = std::mem::size_of::<u64>();
 
@@ -69,6 +69,39 @@ const U64_SIZE: usize = std::mem::size_of::<u64>();
 pub const META_DOMAIN: &[u8] = b"meta";
 /// Domain prefix for bulk extent data.
 pub const EXTENT_DOMAIN: &[u8] = b"extent";
+
+const INODE_KEY_SIZE: usize = META_DOMAIN.len() + 1 + U64_SIZE;
+const EXTENT_KEY_SIZE: usize = EXTENT_DOMAIN.len() + 1 + U64_SIZE * 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InodeKey([u8; INODE_KEY_SIZE]);
+
+impl AsRef<[u8]> for InodeKey {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl From<InodeKey> for Bytes {
+    fn from(key: InodeKey) -> Self {
+        Self::copy_from_slice(key.as_ref())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExtentKey([u8; EXTENT_KEY_SIZE]);
+
+impl AsRef<[u8]> for ExtentKey {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl From<ExtentKey> for Bytes {
+    fn from(key: ExtentKey) -> Self {
+        Self::copy_from_slice(key.as_ref())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyPrefix {
@@ -189,12 +222,12 @@ impl KeyCodec {
 
     /// Total bytes in a complete inode key.
     pub fn inode_key_size(&self) -> usize {
-        self.id_offset(KeyPrefix::Inode) + U64_SIZE
+        INODE_KEY_SIZE
     }
 
     /// Total bytes in a complete extent key.
     pub fn extent_key_size(&self) -> usize {
-        self.id_offset(KeyPrefix::Extent) + U64_SIZE * 2
+        EXTENT_KEY_SIZE
     }
 
     /// Total bytes in a complete tombstone key.
@@ -207,19 +240,22 @@ impl KeyCodec {
         self.id_offset(KeyPrefix::Orphan) + U64_SIZE
     }
 
-    pub fn inode_key(&self, inode_id: InodeId) -> Bytes {
-        let mut key = Vec::with_capacity(self.inode_key_size());
-        self.push_prefix(&mut key, KeyPrefix::Inode);
-        key.extend_from_slice(&inode_id.to_be_bytes());
-        Bytes::from(key)
+    pub fn inode_key(&self, inode_id: InodeId) -> InodeKey {
+        let mut key = [0; INODE_KEY_SIZE];
+        key[..META_DOMAIN.len()].copy_from_slice(META_DOMAIN);
+        key[self.kind_offset(KeyPrefix::Inode)] = PREFIX_INODE;
+        key[self.id_offset(KeyPrefix::Inode)..].copy_from_slice(&inode_id.to_be_bytes());
+        InodeKey(key)
     }
 
-    pub fn extent_key(&self, inode_id: InodeId, extent_index: u64) -> Bytes {
-        let mut key = Vec::with_capacity(self.extent_key_size());
-        self.push_prefix(&mut key, KeyPrefix::Extent);
-        key.extend_from_slice(&inode_id.to_be_bytes());
-        key.extend_from_slice(&extent_index.to_be_bytes());
-        Bytes::from(key)
+    pub fn extent_key(&self, inode_id: InodeId, extent_index: u64) -> ExtentKey {
+        let mut key = [0; EXTENT_KEY_SIZE];
+        key[..EXTENT_DOMAIN.len()].copy_from_slice(EXTENT_DOMAIN);
+        key[self.kind_offset(KeyPrefix::Extent)] = PREFIX_EXTENT;
+        let id_offset = self.id_offset(KeyPrefix::Extent);
+        key[id_offset..id_offset + U64_SIZE].copy_from_slice(&inode_id.to_be_bytes());
+        key[id_offset + U64_SIZE..].copy_from_slice(&extent_index.to_be_bytes());
+        ExtentKey(key)
     }
 
     pub fn parse_extent_key(&self, key: &[u8]) -> Option<u64> {
@@ -354,10 +390,7 @@ impl KeyCodec {
     }
 
     pub fn system_counter_key(&self) -> Bytes {
-        let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::System) + 1);
-        self.push_prefix(&mut key, KeyPrefix::System);
-        key.push(SYSTEM_COUNTER_SUBTYPE);
-        Bytes::from(key)
+        Bytes::from_static(SYSTEM_COUNTER_KEY)
     }
 
     /// Key for HA provenance flushed atomically with each replicated leader
@@ -365,10 +398,7 @@ impl KeyCodec {
     /// history, and highest locally applied ship attempt; takeover validates the
     /// volatile tail and exact-result ledger against it.
     pub fn ha_seqno_key(&self) -> Bytes {
-        let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::System) + 1);
-        self.push_prefix(&mut key, KeyPrefix::System);
-        key.push(SYSTEM_HA_SEQNO_SUBTYPE);
-        Bytes::from(key)
+        Bytes::from_static(SYSTEM_HA_SEQNO_KEY)
     }
 
     pub(crate) fn encode_ha_stamp(stamp: &HaStamp) -> Bytes {
@@ -388,27 +418,18 @@ impl KeyCodec {
 
     /// Key for the durability lineage token (a single u64).
     pub fn lineage_key(&self) -> Bytes {
-        let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::System) + 1);
-        self.push_prefix(&mut key, KeyPrefix::System);
-        key.push(SYSTEM_LINEAGE_SUBTYPE);
-        Bytes::from(key)
+        Bytes::from_static(SYSTEM_LINEAGE_KEY)
     }
 
     /// Key for the Solo taint (the lineage token that went Solo).
     pub fn taint_key(&self) -> Bytes {
-        let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::System) + 1);
-        self.push_prefix(&mut key, KeyPrefix::System);
-        key.push(SYSTEM_TAINT_SUBTYPE);
-        Bytes::from(key)
+        Bytes::from_static(SYSTEM_TAINT_KEY)
     }
 
     /// Key for the last-orphan-sweep wall-clock timestamp (epoch seconds, a u64 via
     /// [`Self::encode_u64`]).
     pub fn last_orphan_sweep_key(&self) -> Bytes {
-        let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::System) + 1);
-        self.push_prefix(&mut key, KeyPrefix::System);
-        key.push(SYSTEM_ORPHAN_SWEEP_SUBTYPE);
-        Bytes::from(key)
+        Bytes::from_static(SYSTEM_ORPHAN_SWEEP_KEY)
     }
 
     pub fn encode_u64(value: u64) -> Bytes {
@@ -668,25 +689,25 @@ mod tests {
         let inode_id = 7u64;
         let extent_index = 99u64;
         let key = codec.extent_key(inode_id, extent_index);
-        assert_eq!(codec.parse_extent_key(&key), Some(extent_index));
+        assert_eq!(codec.parse_extent_key(key.as_ref()), Some(extent_index));
     }
 
     #[test]
     fn test_layout_routing() {
         let codec = KeyCodec::new();
         let inode_key = codec.inode_key(0);
-        assert!(inode_key.starts_with(META_DOMAIN));
-        assert_eq!(inode_key[META_DOMAIN.len()], PREFIX_INODE);
+        assert!(inode_key.as_ref().starts_with(META_DOMAIN));
+        assert_eq!(inode_key.as_ref()[META_DOMAIN.len()], PREFIX_INODE);
 
         let extent_key = codec.extent_key(0, 0);
-        assert!(extent_key.starts_with(EXTENT_DOMAIN));
-        assert_eq!(extent_key[EXTENT_DOMAIN.len()], PREFIX_EXTENT);
+        assert!(extent_key.as_ref().starts_with(EXTENT_DOMAIN));
+        assert_eq!(extent_key.as_ref()[EXTENT_DOMAIN.len()], PREFIX_EXTENT);
 
         let tombstone = codec.tombstone_key(0, 0);
         assert!(tombstone.starts_with(META_DOMAIN));
 
         // No metadata key should be misrouted into the extent domain.
-        assert!(!inode_key.starts_with(EXTENT_DOMAIN));
+        assert!(!inode_key.as_ref().starts_with(EXTENT_DOMAIN));
         assert!(!tombstone.starts_with(EXTENT_DOMAIN));
     }
 
@@ -709,7 +730,7 @@ mod tests {
         assert!(sc.as_ref() >= start.as_ref() && sc.as_ref() < end.as_ref());
         let ino = codec.inode_key(9);
         assert!(!(ino.as_ref() >= start.as_ref() && ino.as_ref() < end.as_ref()));
-        assert_eq!(codec.parse_segcount_key(&ino), None);
+        assert_eq!(codec.parse_segcount_key(ino.as_ref()), None);
     }
 
     #[test]
@@ -862,7 +883,10 @@ mod tests {
             ParsedKey::Unknown
         ));
         let inode_key = codec.inode_key(1);
-        assert!(matches!(codec.parse_key(&inode_key), ParsedKey::Unknown));
+        assert!(matches!(
+            codec.parse_key(inode_key.as_ref()),
+            ParsedKey::Unknown
+        ));
     }
 }
 
@@ -885,8 +909,8 @@ mod prop_tests {
             let codec = KeyCodec::new();
             let ka = codec.extent_key(a.0, a.1);
             let kb = codec.extent_key(b.0, b.1);
-            prop_assert_eq!(codec.parse_extent_key(&ka), Some(a.1));
-            prop_assert_eq!(codec.parse_extent_key(&kb), Some(b.1));
+            prop_assert_eq!(codec.parse_extent_key(ka.as_ref()), Some(a.1));
+            prop_assert_eq!(codec.parse_extent_key(kb.as_ref()), Some(b.1));
             prop_assert_eq!(ka.as_ref().cmp(kb.as_ref()), a.cmp(&b));
         }
 
@@ -950,7 +974,7 @@ mod prop_tests {
             name in prop::collection::vec(any::<u8>(), 0..40),
         ) {
             let codec = KeyCodec::new();
-            prop_assert_eq!(codec.parse_extent_key(&codec.inode_key(ino)), None);
+            prop_assert_eq!(codec.parse_extent_key(codec.inode_key(ino).as_ref()), None);
             prop_assert_eq!(codec.parse_extent_key(&codec.tombstone_key(x, ino)), None);
             prop_assert_eq!(codec.parse_extent_key(&codec.orphan_key(ino)), None);
             prop_assert_eq!(codec.parse_extent_key(&codec.dir_scan_key(ino, x)), None);
